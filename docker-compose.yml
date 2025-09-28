@@ -1,0 +1,63 @@
+version: '3.3'
+services:
+  # Your Traefik service goes here. Ensure its IP is the same as the one 
+  # associated with the DEFAULT_PROXY_HOST_UUID in OPNsense.
+
+  dns-updater:
+    image: ghcr.io/chelming/tuda-sync:latest
+    container_name: tuda-sync
+    environment:
+      # --- REQUIRED OPNsense Credentials ---
+      - OPNSENSE_HOST=192.168.1.1       # OPNsense IP
+      - OPNSENSE_KEY=YOUR_API_KEY       # API Key
+      - OPNSENSE_SECRET=YOUR_API_SECRET # API Secret
+      
+      # --- REQUIRED DNS/Traefik Settings ---
+      - BASE_DOMAIN=hlm.ing
+      
+      # REQUIRED DEFAULT UUID: Use the UUID of your main Traefik A record host override.
+      - DEFAULT_PROXY_HOST_UUID=00000000-A-1111-B-222222222222
+
+      # --- Extensibility (Defaults used if omitted) ---
+      - OPNSENSE_PROTOCOL=https
+      - OPNSENSE_INSECURE=false               # Set 'true' to skip self-signed cert checks
+      - TRAEFIK_LABEL_NAME=traefik.enable     # Label to filter containers
+      - UNBOUND_UUID_LABEL=opnsense.unbound.host_uuid # Label used for overrides
+      
+      # --- Traefik API Integration ---
+      - TRAEFIK_API_URL=http://traefik:8080/api  # URL to Traefik API
+      - TRAEFIK_USE_API=true                     # Enable Traefik API integration
+      - TRAEFIK_API_USERNAME=                    # Optional: Username for Traefik API basic auth
+      - TRAEFIK_API_PASSWORD=                    # Optional: Password for Traefik API basic auth
+      # Multiple traefik instances support
+      # Format: label:domain,label2:domain2
+      # - TRAEFIK_INSTANCES=traefik.primary.enable:example.com,traefik.secondary.enable:internal.example.com
+
+    # SECURITY: Docker socket is mounted read-only for security best practice
+    # For enhanced security, consider using a Docker socket proxy in production
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: always
+    # Expose health and metrics endpoint
+    ports:
+      - "8080:8080"
+    # Ensure this service starts after Traefik
+    depends_on:
+      - traefik 
+
+  # Example Service using the DEFAULT UUID
+  vault:
+    image: vault:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.vault.rule=Host(`vault.hlm.ing`)"
+      # No 'opnsense.unbound.host_uuid' label means it uses DEFAULT_PROXY_HOST_UUID
+
+  # Example Service using an OVERRIDE UUID
+  plex:
+    image: plex:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.plex.rule=Host(`plex.hlm.ing`)"
+      # OVERRIDE: Uses a different UUID, pointing to a different A record/IP
+      - "opnsense.unbound.host_uuid=00000000-C-3333-D-444444444444"

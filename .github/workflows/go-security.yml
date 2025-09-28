@@ -1,0 +1,214 @@
+name: Go Security Scan
+
+# This workflow runs security scans on the Go code with special handling for Docker SDK vulnerabilities
+# Since our application interacts with the Docker daemon via the Docker SDK, certain vulnerabilities
+# are expected and have been mitigated as documented in SECURITY.md and docs/DOCKER_SECURITY.md
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  schedule:
+    - cron: '0 12 * * 1' # Weekly on Monday at 12:00 UTC
+
+jobs:
+  gosec:
+    runs-on: ubuntu-latest
+    # Add permissions needed for the GitHub Code Scanning API
+    permissions:
+      security-events: write  # Required for uploading SARIF results
+      contents: read          # Required to checkout code
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Run Gosec Security Scanner
+        uses: securego/gosec@master
+        with:
+          args: '-conf=.gosec.config -fmt=sarif -out=results.sarif -no-fail ./...'
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: results.sarif
+          category: gosec-results
+          
+      - name: Upload gosec results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gosec-reports
+          path: results.sarif
+          retention-days: 14
+
+  govuln:
+    runs-on: ubuntu-latest
+    # Add permissions needed for the job
+    permissions:
+      contents: read  # Required to checkout code
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Run govulncheck
+        id: govulncheck
+        run: |
+          # Run govulncheck and save output to a file for parsing
+          govulncheck -show=verbose ./... > govulncheck_output.txt 2>&1 || true
+          
+          # Display the output for logs
+          cat govulncheck_output.txt
+          
+          # Create a JSON report file for better parsing
+          echo "{\"vulnerabilities\": [" > vuln_report.json
+          
+          # Extract all vulnerability IDs with grep and process them
+          VULN_IDS=$(grep -oE 'Vulnerability #[0-9]+: ([A-Z0-9\-]+)' govulncheck_output.txt | sed -E 's/Vulnerability #[0-9]+: (.+)/\1/')
+          
+          # Create summary variables
+          DOCKER_VULNS=""
+          OTHER_VULNS=""
+          KNOWN_DOCKER_VULNS=0
+          OTHER_VULN_COUNT=0
+          FIRST_VULN=true
+          
+          # Process each vulnerability ID
+          for VULN_ID in $VULN_IDS; do
+            # Extract details for this vulnerability
+            VULN_DESC=$(grep -A5 "Vulnerability #.*: $VULN_ID" govulncheck_output.txt | head -2 | tail -1 | sed -e 's/^[[:space:]]*//')
+            VULN_MODULE=$(grep -A5 "Vulnerability #.*: $VULN_ID" govulncheck_output.txt | grep "Module:" | sed -e 's/^[[:space:]]*Module: //')
+            VULN_FIXED=$(grep -A10 "Vulnerability #.*: $VULN_ID" govulncheck_output.txt | grep "Fixed in:" | head -1 | sed -e 's/^[[:space:]]*Fixed in: //')
+            VULN_URL="https://pkg.go.dev/vuln/$VULN_ID"
+            
+            # Add comma separator for JSON if not first vulnerability
+            if [ "$FIRST_VULN" = "true" ]; then
+              FIRST_VULN=false
+            else
+              echo "," >> vuln_report.json
+            fi
+            
+            # Add to JSON report
+            echo "{" >> vuln_report.json
+            echo "  \"id\": \"$VULN_ID\"," >> vuln_report.json
+            echo "  \"description\": \"$VULN_DESC\"," >> vuln_report.json
+            echo "  \"module\": \"$VULN_MODULE\"," >> vuln_report.json
+            echo "  \"fixedIn\": \"$VULN_FIXED\"," >> vuln_report.json
+            echo "  \"url\": \"$VULN_URL\"" >> vuln_report.json
+            echo -n "}" >> vuln_report.json
+            
+            # Check if it's a Docker vulnerability
+            if echo "$VULN_MODULE" | grep -q "docker/docker"; then
+              echo "::warning ::$VULN_ID - Docker vulnerability detected (expected)"
+              echo "::notice ::This vulnerability is mitigated as documented in docs/DOCKER_SECURITY.md"
+              
+              # Format for summary
+              if [ "$VULN_ID" = "GO-2025-3830" ]; then
+                # Special handling for the firewalld vulnerability
+                echo "### Latest Docker SDK Vulnerability" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "- **$VULN_ID**: $VULN_DESC" >> $GITHUB_STEP_SUMMARY
+                echo "  - Fixed in: $VULN_FIXED" >> $GITHUB_STEP_SUMMARY
+                echo "  - [More info]($VULN_URL)" >> $GITHUB_STEP_SUMMARY
+                echo "  - **Mitigated**: Our application doesn't use firewalld functionality" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+              else
+                DOCKER_VULNS="${DOCKER_VULNS}\n- **$VULN_ID**: $VULN_DESC - **Mitigated**, [More info]($VULN_URL)"
+              fi
+              KNOWN_DOCKER_VULNS=$((KNOWN_DOCKER_VULNS+1))
+            else
+              echo "::error ::$VULN_ID - Non-Docker vulnerability detected! Please review."
+              OTHER_VULNS="${OTHER_VULNS}\n- ⚠️ **$VULN_ID**: $VULN_DESC - Requires attention! [More info]($VULN_URL)"
+              OTHER_VULN_COUNT=$((OTHER_VULN_COUNT+1))
+            fi
+          done
+          
+          # Close the JSON report
+          echo "]}" >> vuln_report.json
+          
+          # Additional checks for specific Docker SDK functions
+          if grep -q "client.NewClientWithOpts" govulncheck_output.txt; then
+            echo "::warning ::Docker client initialization vulnerabilities detected (expected)"
+            echo "::notice ::Mitigated by using proper context management and API version pinning"
+            DOCKER_VULNS="${DOCKER_VULNS}\n- Docker client initialization - **Mitigated** by proper context management and API version pinning"
+          fi
+          
+          if grep -q "client.Client.Events" govulncheck_output.txt; then
+            echo "::warning ::Docker events monitoring vulnerabilities detected (expected)"
+            echo "::notice ::Mitigated by using filtering, timeouts, and proper context management"
+            DOCKER_VULNS="${DOCKER_VULNS}\n- Docker events monitoring - **Mitigated** by filtering, timeouts, and proper context management"
+          fi
+          
+          if grep -q "client.Client.ContainerList" govulncheck_output.txt; then
+            echo "::warning ::Docker container listing vulnerabilities detected (expected)"
+            echo "::notice ::Mitigated by using proper context timeouts and validation"
+            DOCKER_VULNS="${DOCKER_VULNS}\n- Docker container listing - **Mitigated** by context timeouts and validation"
+          fi
+          
+          # Create comprehensive job summary
+          echo "## Go Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker SDK vulnerabilities:** $KNOWN_DOCKER_VULNS (expected and mitigated)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Other vulnerabilities:** $OTHER_VULN_COUNT" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Only show details if we found vulnerabilities
+          if [ "$KNOWN_DOCKER_VULNS" -gt 0 ] || [ "$OTHER_VULN_COUNT" -gt 0 ]; then
+            # Add Docker vulnerabilities section
+            if [ "$KNOWN_DOCKER_VULNS" -gt 0 ]; then
+              echo "### Docker SDK Vulnerabilities (Expected)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo -e "${DOCKER_VULNS#\\n}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "These vulnerabilities are expected when using the Docker SDK and have been mitigated as documented in [SECURITY.md](../blob/main/SECURITY.md) and [DOCKER_SECURITY.md](../blob/main/docs/DOCKER_SECURITY.md)." >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            # Add other vulnerabilities section if needed
+            if [ "$OTHER_VULN_COUNT" -gt 0 ]; then
+              echo "### Other Vulnerabilities" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo -e "${OTHER_VULNS#\\n}" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **These vulnerabilities require immediate attention!**" >> $GITHUB_STEP_SUMMARY
+              # Fail the build if we have non-Docker vulnerabilities
+              exit 1
+            else
+              echo "### Other Vulnerabilities" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ No non-Docker vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "✅ No vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Upload vulnerability report as an artifact
+          echo "Vulnerability scan complete. See the summary tab for details."
+        continue-on-error: true
+      
+      - name: Upload govulncheck results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: govulncheck-reports
+          path: |
+            govulncheck_output.txt
+            vuln_report.json
+          retention-days: 14

@@ -1,0 +1,62 @@
+### Go ###
+# Compiled binaries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Binary output
+/tuda-sync
+/main
+/bin/
+
+# Dependency directories (should NOT ignore go.sum)
+/vendor/
+/pkg/
+
+# Build and cache directories
+/.cache/
+/.build/
+/cover.html
+/coverage.txt
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Logs
+*~
+*.log
+/log/
+
+# Debug files
+__debug_bin
+debug
+debug.test
+
+# Configuration files that might contain secrets
+config.local.yaml
+*.local.yml
+*.local.yaml
+
