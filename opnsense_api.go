@@ -312,12 +312,9 @@ func (o *OpnsenseClient) ClearAllAliases() error {
 		uuid, ok := aliasMap["uuid"].(string)
 		if !ok { continue }
 		
-		// Attempt to delete
-		delPayload := map[string]interface{}{
-			"uuid": uuid,
-		}
-		
-		_, err := o.makeRequest(http.MethodPost, "del_host_alias", delPayload)
+		// Attempt to delete - append UUID to the endpoint path
+		// OPNsense expects the UUID in the URL path, not the request body
+		_, err := o.makeRequest(http.MethodPost, "del_host_alias/"+uuid, map[string]interface{}{})
 		if err != nil {
 			log.Printf("WARNING: Failed to delete alias with UUID %s: %v", uuid, err)
 		} else {
@@ -436,12 +433,9 @@ func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
 		return nil // Not found, treat as success
 	}
 
-	// 3. Delete the alias using its UUID
-	delPayload := map[string]interface{}{
-		"uuid": targetUUID,
-	}
-	
-	_, err = o.makeRequest(http.MethodPost, "del_host_alias", delPayload)
+	// 3. Delete the alias using its UUID - append UUID to the endpoint path
+	// OPNsense expects the UUID in the URL path, not the request body
+	_, err = o.makeRequest(http.MethodPost, "del_host_alias/"+targetUUID, map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("failed to delete host alias %s (UUID: %s): %w", fqdn, targetUUID, err)
 	}
