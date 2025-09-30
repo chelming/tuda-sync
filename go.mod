@@ -8,6 +8,8 @@ require (
 	github.com/rs/zerolog v1.31.0
 )
 
+require golang.org/x/net v0.43.0
+
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

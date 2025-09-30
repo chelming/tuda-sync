@@ -147,7 +147,8 @@ func (o *OpnsenseClient) makeRequest(method, endpoint string, payload interface{
 	}
 
 	// This check catches JSON responses that contain an explicit API failure message.
-	if result["result"] != nil && result["result"] != "OK" {
+	// Accept both "OK" and "saved" as valid results
+	if result["result"] != nil && result["result"] != "OK" && result["result"] != "saved" {
 		return nil, fmt.Errorf("OPNsense API reported failure: %v", result)
 	}
 
@@ -449,10 +450,37 @@ func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
 func (o *OpnsenseClient) Reconfigure() error {
 	log.Println("Applying changes by reconfiguring Unbound...")
 	
-	// The reconfigure endpoint is under the service module
-	_, err := o.makeRequest(http.MethodPost, "reconfigure", map[string]interface{}{})
+	// Create context with timeout for the request
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	
+	// The reconfigure endpoint is under the service module, not settings
+	serviceURL := strings.Replace(o.url, "/settings", "/service", 1)
+	fullURL := serviceURL + "/reconfigure"
+	
+	log.Printf("DEBUG: Making POST request to %s", fullURL)
+	
+	body, _ := json.Marshal(map[string]interface{}{})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.SetBasicAuth(o.key, o.secret)
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := o.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to reconfigure Unbound: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		previewLen := min(len(respBody), 150)
+		log.Printf("ERROR: Reconfigure API call failed. Status: %s. Response body start: %s", 
+            resp.Status, string(respBody)[:previewLen])
+		return fmt.Errorf("failed to reconfigure Unbound: API request failed with HTTP status: %s", resp.Status)
 	}
 	
 	log.Println("Unbound reconfigured successfully.")

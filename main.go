@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -58,6 +59,8 @@ var (
 	// Flags for operation mode
 	clearOnStart bool
 	scanOnly bool
+	scanAllRoutes bool
+	routeScanInterval time.Duration
 	
 	// Reconfiguration debounce mechanism
 	reconfigureMutex sync.Mutex
@@ -87,6 +90,17 @@ var (
 // Helper function to check for "true" string in environment variable
 func getEnvBool(key string) bool {
 	return strings.ToLower(os.Getenv(key)) == "true"
+}
+
+// Helper function to get a duration from an environment variable with a default
+func getEnvDuration(key string, defaultDuration time.Duration) time.Duration {
+	if envValue := os.Getenv(key); envValue != "" {
+		if parsed, err := time.ParseDuration(envValue); err == nil {
+			return parsed
+		}
+		log.Printf("WARNING: Invalid duration format for %s, using default: %v", key, defaultDuration)
+	}
+	return defaultDuration
 }
 
 func init() {
@@ -125,6 +139,8 @@ func init() {
 	// 4. Flags for operation modes
 	flag.BoolVar(&clearOnStart, "clear-on-start", getEnvBool("CLEAN_ON_START"), "If set, deletes ALL existing Unbound aliases on application startup. (Env: CLEAN_ON_START=true)")
 	flag.BoolVar(&scanOnly, "scan-only", getEnvBool("SCAN_ONLY"), "If set, only scans existing containers and exits. (Env: SCAN_ONLY=true)")
+	flag.BoolVar(&scanAllRoutes, "scan-all-routes", getEnvBool("SCAN_ALL_ROUTES"), "Scan all Traefik routes (including file-based configs). (Env: SCAN_ALL_ROUTES=true)")
+	flag.DurationVar(&routeScanInterval, "route-scan-interval", getEnvDuration("ROUTE_SCAN_INTERVAL", 5*time.Minute), "How often to scan all Traefik routes. (Env: ROUTE_SCAN_INTERVAL, default: 5m)")
 
 	// Set default protocol if not provided
 	if opnsenseProtocol == "" {
@@ -235,10 +251,45 @@ func main() {
 		}
 		return
 	}
+	
+	// --- Handle scan-routes-only mode ---
+	if command == "scan-routes" {
+		log.Println("Running in scan-routes-only mode")
+		ctx := context.Background()
+		if err := scanAllTraefikRoutes(ctx, opnsenseClient); err != nil {
+			log.Fatalf("Error scanning Traefik routes: %v", err)
+		}
+		return
+	}
 
 	// --- Handle main monitor loop ---
 	if command == "" {
-		runDockerMonitor(opnsenseClient)
+		// Create a parent context that we can cancel on shutdown
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		
+		// Set up signal handling for graceful shutdown
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		
+		go func() {
+			sig := <-sigCh
+			log.Printf("Received signal %v, shutting down...", sig)
+			cancel()
+		}()
+		
+		// Start the Docker monitor
+		go runDockerMonitor(opnsenseClient)
+		
+		// If enabled, also start the Traefik routes scanner
+		if scanAllRoutes && traefikApiEnabled {
+			log.Printf("Starting Traefik routes scanner with %v interval", routeScanInterval)
+			go startTraefikRoutesScanner(ctx, opnsenseClient, routeScanInterval)
+		}
+		
+		// Wait for signal
+		<-ctx.Done()
+		log.Println("Shutdown complete")
 		return
 	}
 
@@ -253,12 +304,15 @@ func runDockerMonitor(opnsenseClient *OpnsenseClient) {
 		log.Fatal("ERROR: DEFAULT_PROXY_HOST_UUID environment variable or --proxy-uuid flag is required to run the monitor.")
 	}
 
-	// Setup signal handling for graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Create a context for this monitor
+	ctx := context.Background()
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	
+	// Set up signal handling for graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	
 	go func() {
 		sig := <-sigCh
@@ -317,27 +371,62 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 	if msg.Type != "container" {
 		return
 	}
+	
+	// Filter out exec and health check related events
+	actionStr := string(msg.Action)
+	if strings.HasPrefix(actionStr, "exec_") || strings.HasPrefix(actionStr, "health_") {
+		return
+	}
 
 	// Extract container information
 	labels := msg.Actor.Attributes
 	containerName := strings.TrimPrefix(labels["name"], "/")
 	
+	// Log all event information for debugging purposes
+	containerID := msg.ID
+	log.Printf("Handling Docker event for container %s (ID: %s, Action: %s)", containerName, containerID, msg.Action)
+	
+	// If this container has a Docker Compose service name, log it and use it for lookup
+	var composeService string
+	var hasComposeService bool
+	if composeServiceVal, exists := labels["com.docker.compose.service"]; exists {
+		composeService = composeServiceVal
+		hasComposeService = true
+		if composeService != containerName {
+			log.Printf("Container %s has Docker Compose service name: %s", containerName, composeService)
+		}
+	}
+	
+	// For 'start' events, check if this container has the tuda.ignore label
+	if actionStr == "start" {
+		// Check if container should be ignored based on its labels
+		if val, exists := labels["tuda.ignore"]; exists &&
+		   (val == "true" || val == "1" || val == "yes") {
+			log.Printf("Container %s has tuda.ignore=true, skipping DNS alias creation", containerName)
+			return
+		}
+	}
+	
 	// First check if this container has traefik enabled
 	hasTraefikLabel := false
 	for labelKey := range traefikInstances {
-		if _, exists := labels[labelKey]; exists {
-			hasTraefikLabel = true
-			break
+		if value, exists := labels[labelKey]; exists {
+			// Accept various forms of "true" value
+			if value == "true" || value == "1" || value == "yes" || value == "on" {
+				hasTraefikLabel = true
+				break
+			}
 		}
 	}
 	
 	if !hasTraefikLabel {
 		// Not a container managed by Traefik
+		log.Printf("Skipping container %s - not managed by Traefik (no traefik.enable=true label)", containerName)
 		return
 	}
 	
 	// If this is a 'die' event, invalidate the container cache entry
-	if msg.Action == "die" {
+	if actionStr == "die" {
 		containerFQDNCache.mutex.Lock()
 		delete(containerFQDNCache.cache, containerName)
 		delete(containerFQDNCache.expiration, containerName)
@@ -347,18 +436,59 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 	// Try Traefik API first if enabled
 	var fqdn string
 	if traefikApiEnabled && traefikApiUrl != "" {
-		fqdns, err := getTraefikRoutersForContainer(containerName)
-		if err == nil && len(fqdns) > 0 {
-			// Use the first FQDN found
-			fqdn = fqdns[0]
-			// Don't log here as getTraefikRoutersForContainer already logs for cache hits
+		var lookupNames []string
+		
+		// Prepare lookup names with different variations to try
+		if hasComposeService && composeService != "" {
+			// Add service name as primary lookup
+			lookupNames = append(lookupNames, composeService)
+			
+			// Also try with -docker suffix if it doesn't already have it
+			if !strings.HasSuffix(composeService, "-docker") {
+				lookupNames = append(lookupNames, composeService+"-docker")
+			}
+			
+			// And try without -docker suffix if it has it
+			if strings.HasSuffix(composeService, "-docker") {
+				baseName := strings.TrimSuffix(composeService, "-docker")
+				lookupNames = append(lookupNames, baseName)
+			}
+			
+			log.Printf("Using Docker Compose service name variations for lookup: %v", lookupNames)
+		} else {
+			lookupNames = []string{containerName}
+		}
+		
+		// Try each lookup name until we find a match
+		for _, lookupName := range lookupNames {
+			fqdns, err := getTraefikRoutersForContainer(lookupName)
+				if err == nil && len(fqdns) > 0 {
+				// Use the first FQDN found
+				fqdn = fqdns[0]
+				log.Printf("Found route for '%s' using lookup name '%s'", fqdn, lookupName)
+				break // Exit the loop once we find a match
+			}
+		}
+		
+		// If we didn't find anything with all our lookups, log it
+		if fqdn == "" && hasComposeService {
+			log.Printf("WARNING: Could not find Traefik routes for service '%s' or any of its variations", composeService)
+			
+			// As a last resort, try the container name if different from service name
+			if containerName != composeService {
+				log.Printf("Falling back to container name '%s' for Traefik API lookup", containerName)
+				fqdns, err := getTraefikRoutersForContainer(containerName)
+				if err == nil && len(fqdns) > 0 {
+					fqdn = fqdns[0]
+				}
+			}
 		}
 	}
 	
 	// If API didn't return anything, look for explicit Host rule in labels
 	if fqdn == "" {
 		for k, v := range labels {
-			if strings.Contains(k, "traefik.http.routers.") && strings.Contains(k, ".rule") && strings.Contains(v, "Host(") {
+			if strings.Contains(k, ".rule") && strings.Contains(v, "Host(") {
 				// Extract FQDN from the Traefik rule, assuming the format: Host(`subdomain.domain.com`)
 				fqdn = extractFQDN(v)
 				if fqdn != "" {
@@ -369,13 +499,28 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 		}
 	}
 	
-	// If no explicit Host rule found, use container name
+	// No special cases for container names
+	
+	// If no explicit Host rule found, use the proper name
 	if fqdn == "" {
 		if baseDomain != "" {
-			fqdn = containerName + "." + baseDomain
-			log.Printf("No Host rule found for %s, using generated name: %s", containerName, fqdn)
+			// Determine the best name to use based on container or service name
+			fqdnName := containerName
+			
+			// Use Docker Compose service name if available
+			if hasComposeService && composeService != "" {
+				fqdnName = composeService
+				log.Printf("Using Docker Compose service name '%s' for DNS alias", composeService)
+			}
+			
+			fqdn = fqdnName + "." + baseDomain
+			log.Printf("No Host rule found, using generated name: %s", fqdn)
 		} else {
-			log.Printf("Container %s has no Host rule and no BASE_DOMAIN is set, skipping", containerName)
+			// Only log this once for each container - subsequent events will be silently skipped
+			// This reduces log spam while still providing the necessary information
+			if actionStr == "start" {
+				log.Printf("Container %s has no Host rule and no BASE_DOMAIN is set, skipping", containerName)
+			}
 			return
 		}
 	}
@@ -385,7 +530,7 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 		fqdn = strings.ReplaceAll(fqdn, "{$BASE_DOMAIN}", baseDomain)
 	}
 
-	switch msg.Action {
+	switch actionStr {
 	case "start":
 		log.Printf("Container START: Adding DNS Alias for %s", fqdn)
 		if err := opnsenseClient.CreateAlias(fqdn, defaultProxyHostUUID); err != nil {
@@ -408,16 +553,41 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 
 // extractFQDN parses the FQDN from a Traefik Host rule string (e.g., "Host(`test.example.com`)")
 func extractFQDN(rule string) string {
+	// Handle backtick format: Host(`example.com`)
 	start := strings.Index(rule, "`")
-	if start == -1 {
-		return ""
+	if start != -1 {
+		end := strings.LastIndex(rule, "`")
+		if end != -1 && end > start {
+			return rule[start+1 : end]
+		}
 	}
-	end := strings.LastIndex(rule, "`")
-	if end == -1 || end <= start {
-		return ""
+	
+	// Handle double-quote format: Host("example.com")
+	start = strings.Index(rule, "\"")
+	if start != -1 {
+		end := strings.LastIndex(rule, "\"")
+		if end != -1 && end > start {
+			return rule[start+1 : end]
+		}
 	}
-	// Return the content between the backticks
-	return rule[start+1 : end]
+	
+	// Handle single-quote format: Host('example.com')
+	start = strings.Index(rule, "'")
+	if start != -1 {
+		end := strings.LastIndex(rule, "'")
+		if end != -1 && end > start {
+			return rule[start+1 : end]
+		}
+	}
+	
+	// If we couldn't match any of the standard formats, try a regex approach
+	regex := regexp.MustCompile(`Host\([^)]*[\'"\` + "`" + `]([^\'"\` + "`" + `]+)[\'"\` + "`" + `][^)]*\)`)
+	matches := regex.FindStringSubmatch(rule)
+	if len(matches) > 1 {
+		return matches[1]
+	}
+	
+	return ""
 }
 
 // TraefikRouter represents the structure of a router in Traefik API
@@ -438,8 +608,8 @@ func fetchTraefikRouters() ([]TraefikRouter, error) {
 	
 	// Check if we have a valid cached response
 	traefikRouterCache.mutex.RLock()
-	cacheValid := !traefikRouterCache.lastFetched.IsZero() && 
-		time.Since(traefikRouterCache.lastFetched) < traefikCacheDuration && 
+	cacheValid := !traefikRouterCache.lastFetched.IsZero() &&
+		time.Since(traefikRouterCache.lastFetched) < traefikCacheDuration &&
 		len(traefikRouterCache.routers) > 0
 	
 	if cacheValid {
@@ -456,8 +626,8 @@ func fetchTraefikRouters() ([]TraefikRouter, error) {
 	defer traefikRouterCache.mutex.Unlock()
 	
 	// Double-check that another goroutine hasn't updated the cache while we were waiting for the lock
-	if !traefikRouterCache.lastFetched.IsZero() && 
-	   time.Since(traefikRouterCache.lastFetched) < traefikCacheDuration && 
+	if !traefikRouterCache.lastFetched.IsZero() &&
+	   time.Since(traefikRouterCache.lastFetched) < traefikCacheDuration &&
 	   len(traefikRouterCache.routers) > 0 {
 		return traefikRouterCache.routers, nil
 	}
@@ -557,14 +727,202 @@ func getTraefikRoutersForContainer(containerName string) ([]string, error) {
 	result := []string{}
 	containerNameWithoutSlash := normalizedName
 	
+	// Look for routers that match this container's name in various ways
+	// First, try direct matching on router name
+	containerRouters := []TraefikRouter{}
+	
+	// We need to check multiple patterns since Traefik can generate router names in different ways
+	possibleMatches := []string{
+		containerNameWithoutSlash,                  // Direct container name
+		"default-" + containerNameWithoutSlash,     // Default prefix
+		containerNameWithoutSlash + "-",            // Container name as prefix
+		"-" + containerNameWithoutSlash,            // Container name as suffix
+		"@docker",                                  // Docker provider indicator
+		containerNameWithoutSlash + "@docker",      // Common Docker provider pattern: servicename@docker
+		containerNameWithoutSlash + "-docker@docker", // Common Docker provider pattern: servicename-docker@docker
+		"opds-" + containerNameWithoutSlash,        // Common pattern with service prefix
+		containerNameWithoutSlash + "-" + "service", // Common pattern with service suffix
+	}
+	
+	// Add variations for the container name
+	if strings.HasSuffix(containerNameWithoutSlash, "-docker") {
+		// If name has -docker suffix, also try without it
+		baseName := strings.TrimSuffix(containerNameWithoutSlash, "-docker")
+		possibleMatches = append(possibleMatches, baseName)
+		possibleMatches = append(possibleMatches, baseName + "@docker")
+	} else {
+		// If name doesn't have -docker suffix, try with it
+		possibleMatches = append(possibleMatches, containerNameWithoutSlash + "-docker")
+	}
+
+	// Check for service labels that might indicate the service name in Traefik
+	serviceNameRegex := regexp.MustCompile(`traefik\.http\.services\.([^.]+)\.`)
+	
+	// Look through service labels in the container to find service names
+	// We need to get the container from Docker API
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err == nil {
+		defer cli.Close()
+		
+		// Get container info
+		containerInfo, err := cli.ContainerInspect(context.Background(), containerNameWithoutSlash)
+		if err == nil {
+			// First, check for Docker Compose service name which is often used as the router name in Traefik
+			if composeService, exists := containerInfo.Config.Labels["com.docker.compose.service"]; exists && composeService != "" {
+				possibleMatches = append(possibleMatches, composeService)
+				possibleMatches = append(possibleMatches, composeService + "-docker@docker")
+				possibleMatches = append(possibleMatches, composeService + "@docker")
+				log.Printf("Found Docker Compose service name for %s: %s", normalizedName, composeService)
+			}
+			
+			// Look for service name patterns in labels
+			for labelName, labelValue := range containerInfo.Config.Labels {
+				matches := serviceNameRegex.FindStringSubmatch(labelName)
+				if len(matches) > 1 {
+					serviceName := matches[1]
+					possibleMatches = append(possibleMatches, serviceName)
+					possibleMatches = append(possibleMatches, serviceName + "-docker@docker")
+					possibleMatches = append(possibleMatches, serviceName + "@docker")
+					log.Printf("Found potential service name in labels for %s: %s", normalizedName, serviceName)
+				}
+				
+				// Also look for any router rules that might be defined in the labels
+				if strings.Contains(labelName, ".rule") && strings.Contains(labelValue, "Host(") {
+					fqdn := extractFQDN(labelValue)
+					if fqdn != "" {
+						// We found a direct host rule in the labels, add it to results immediately
+						log.Printf("Found Host rule in container labels for %s: %s", normalizedName, fqdn)
+						
+						// Update container-specific cache
+						containerFQDNCache.mutex.Lock()
+						containerFQDNCache.cache[normalizedName] = []string{fqdn}
+						containerFQDNCache.expiration[normalizedName] = time.Now().Add(traefikCacheDuration)
+						containerFQDNCache.mutex.Unlock()
+						
+						return []string{fqdn}, nil
+					}
+				}
+			}
+		}
+	}
+	
+	log.Printf("Looking for Traefik routes for container %s", normalizedName)
+	
 	for _, router := range routers {
-		if strings.Contains(router.Name, containerNameWithoutSlash) && 
-		   strings.Contains(router.Rule, "Host(") {
+		// Check if any of our patterns match the router name
+		matched := false
+		
+		// Check for direct container name match in router name
+		for _, pattern := range possibleMatches {
+			if strings.Contains(router.Name, pattern) {
+				matched = true
+				log.Printf("DEBUG: Router %s matches pattern %s for container %s", router.Name, pattern, normalizedName)
+				break
+			}
+		}
+		
+		// If we have a service name from the router, check that too
+		// This helps with containers that use explicit service names
+		if router.Service != "" { 
+			// Check if service name matches any of our patterns
+			for _, pattern := range possibleMatches {
+				if strings.Contains(router.Service, pattern) {
+					matched = true
+					log.Printf("DEBUG: Router service %s matches pattern %s for container %s", router.Service, pattern, normalizedName)
+					break
+				}
+			}
+			
+			// Check for prefix match in service name (handles cases where service has a suffix)
+			serviceParts := strings.Split(router.Service, "-")
+			if len(serviceParts) > 0 {
+				serviceName := serviceParts[0]
+				
+				// Simple direct matching for first part of service name
+				if serviceName == containerNameWithoutSlash || 
+				   containerNameWithoutSlash == serviceName {
+					matched = true
+					log.Printf("DEBUG: Service prefix %s matches container %s", 
+						serviceName, containerNameWithoutSlash)
+				}
+			}
+		}
+		
+		if matched && strings.Contains(router.Rule, "Host(") {
+			containerRouters = append(containerRouters, router)
 			fqdn := extractFQDN(router.Rule)
 			if fqdn != "" {
 				result = append(result, fqdn)
+				log.Printf("Found route in Traefik API for container %s: %s", normalizedName, fqdn)
 			}
 		}
+	}
+	
+	// If no routers found, try more advanced matching techniques
+	if len(containerRouters) == 0 {
+		log.Printf("No direct routes found for container %s in Traefik API", normalizedName)
+		
+		// Try to find Docker service names by inspecting the container
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err == nil {
+			defer cli.Close()
+			
+			containerInfo, err := cli.ContainerInspect(context.Background(), normalizedName)
+			if err == nil {
+				// Try to extract service name from Docker Compose labels
+				composeService, hasComposeService := containerInfo.Config.Labels["com.docker.compose.service"]
+				if hasComposeService && composeService != "" {
+					log.Printf("Found Docker Compose service name for %s: %s", normalizedName, composeService)
+					
+					// Common Traefik router naming patterns based on service names
+					servicePatterns := []string{
+						composeService,                     // Direct service name match
+						composeService + "-docker@docker",  // Service-docker@docker pattern
+						composeService + "@docker",         // Service@docker pattern
+					}
+					
+					// Look for routers with these service name patterns
+					for _, router := range routers {
+						for _, pattern := range servicePatterns {
+							if strings.Contains(router.Name, pattern) || 
+							   strings.Contains(router.Service, composeService) {
+								if strings.Contains(router.Rule, "Host(") {
+									fqdn := extractFQDN(router.Rule)
+									if fqdn != "" {
+										result = append(result, fqdn)
+										log.Printf("Found route via Docker Compose service for %s: %s (from %s)", 
+											normalizedName, fqdn, composeService)
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// As a last resort, search for all routers with a matching rule that contains the container name
+		if len(result) == 0 {
+			log.Printf("Trying last resort approach - looking for Host rules containing %s", normalizedName)
+			for _, router := range routers {
+				if strings.Contains(router.Rule, "Host(") {
+					fqdn := extractFQDN(router.Rule)
+					if fqdn != "" && strings.HasPrefix(fqdn, normalizedName + ".") {
+						result = append(result, fqdn)
+						log.Printf("Found matching Host rule for %s: %s", normalizedName, fqdn)
+					}
+				}
+			}
+		}
+	}
+	
+	// If we still have no result but have a base domain, generate one
+	if len(result) == 0 && baseDomain != "" {
+		// Create a fallback FQDN using the container name
+		fallbackFQDN := normalizedName + "." + baseDomain
+		result = append(result, fallbackFQDN)
+		log.Printf("No routes found in Traefik API for %s, using fallback FQDN: %s", normalizedName, fallbackFQDN)
 	}
 	
 	// Update container-specific cache
@@ -572,7 +930,13 @@ func getTraefikRoutersForContainer(containerName string) ([]string, error) {
 	containerFQDNCache.cache[normalizedName] = result
 	containerFQDNCache.expiration[normalizedName] = time.Now().Add(traefikCacheDuration)
 	containerFQDNCache.mutex.Unlock()
-	log.Printf("Cached %d FQDNs for container %s", len(result), normalizedName)
+	
+	if len(result) > 0 {
+		log.Printf("Cached %d FQDNs for container %s: %v", len(result), normalizedName, result)
+	} else {
+		// Always log this since it helps with debugging
+		log.Printf("Container %s has no explicit Host rule and no base domain is set, skipping", normalizedName)
+	}
 	
 	return result, nil
 }
@@ -636,6 +1000,13 @@ func scanExistingContainers(ctx context.Context, opnsenseClient *OpnsenseClient)
 			continue
 		}
 		
+		// Check if container has the tuda.ignore label
+		if val, exists := c.Labels["tuda.ignore"]; exists &&
+		   (val == "true" || val == "1" || val == "yes") {
+			log.Printf("Container %s has tuda.ignore=true, skipping DNS alias creation", containerName)
+			continue
+		}
+		
 		// Mark container as processed immediately to avoid repeated processing
 		processedContainers[containerName] = true
 		
@@ -647,13 +1018,47 @@ func scanExistingContainers(ctx context.Context, opnsenseClient *OpnsenseClient)
 				
 				// Try to get router rules from Traefik API first if enabled
 				if traefikApiEnabled && traefikApiUrl != "" {
-					log.Printf("Using Traefik API to look up routes for %s", containerName)
-					fqdns, err := getTraefikRoutersForContainer(containerName)
+				var lookupNames []string
+				
+				// Check for Docker Compose service name
+				if composeService, exists := c.Labels["com.docker.compose.service"]; exists && composeService != "" {
+					// Add service name as primary lookup
+					lookupNames = append(lookupNames, composeService)
 					
-					if err != nil {
-						log.Printf("WARNING: Failed to get routes from Traefik API: %v", err)
-						// Fall back to label parsing if API fails
-					} else if len(fqdns) > 0 {
+					// Also try with -docker suffix if it doesn't already have it
+					if !strings.HasSuffix(composeService, "-docker") {
+						lookupNames = append(lookupNames, composeService+"-docker")
+					}
+					
+					// And try without -docker suffix if it has it
+					if strings.HasSuffix(composeService, "-docker") {
+						baseName := strings.TrimSuffix(composeService, "-docker")
+						lookupNames = append(lookupNames, baseName)
+					}
+					
+					log.Printf("Using Docker Compose service name variations for lookup: %v", lookupNames)
+				} else {
+					lookupNames = []string{containerName}
+				}
+				
+				// Try each lookup name until we find a match
+				var fqdns []string
+				var err error
+				for _, lookupName := range lookupNames {
+					log.Printf("Using Traefik API to look up routes for %s", lookupName)
+					result, err := getTraefikRoutersForContainer(lookupName)
+					if err == nil && len(result) > 0 {
+						fqdns = result
+						log.Printf("Found routes for '%s'", lookupName)
+						break
+					}
+				}
+				
+				// Continue with the found FQDNs or empty list
+				if err != nil {
+					log.Printf("WARNING: Failed to get routes from Traefik API: %v", err)
+					// Fall back to label parsing if API fails
+				} else if len(fqdns) > 0 {
 						// Process FQDNs from Traefik API
 						for _, fqdn := range fqdns {
 							log.Printf("Found route in Traefik API for container %s: %s", containerName, fqdn)
@@ -675,10 +1080,10 @@ func scanExistingContainers(ctx context.Context, opnsenseClient *OpnsenseClient)
 						
 						// Skip label parsing since we got rules from API
 						continue
-					} else {
-						log.Printf("No routes found for container %s in Traefik API", containerName)
-						// Fall back to label parsing
-					}
+				} else {
+					log.Printf("No routes found for container %s in Traefik API", containerName)
+					// Fall back to label parsing
+				}
 				}
 				
 				// Check if we should use the container name as FQDN
@@ -690,15 +1095,25 @@ func scanExistingContainers(ctx context.Context, opnsenseClient *OpnsenseClient)
 					}
 				}
 				
-				// If no explicit Host rule found, use container name as FQDN
+				// If no explicit Host rule found, use the proper name as FQDN
 				if !hasExplicitHostRule {
-					fqdn := containerName
+					// Determine the best name to use
+					fqdnName := containerName
+					
+					// Check for Docker Compose service name as an alternative
+					if composeService, exists := c.Labels["com.docker.compose.service"]; exists && composeService != "" {
+						// Use the service name directly
+						fqdnName = composeService
+						log.Printf("Using Docker Compose service name '%s' for DNS alias", composeService)
+					}
+					
+					fqdn := fqdnName
 					if effectiveBaseDomain := baseDomain; effectiveBaseDomain != "" {
 						if baseDomainOverride != "" {
 							effectiveBaseDomain = baseDomainOverride
 						}
-						// Use container name with base domain
-						fqdn = containerName + "." + effectiveBaseDomain
+						// Use name with base domain
+						fqdn = fqdnName + "." + effectiveBaseDomain
 						
 						log.Printf("Container %s has no explicit Host rule, using name with domain: %s", containerName, fqdn)
 						
