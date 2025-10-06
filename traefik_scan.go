@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
+	
+	// We use the logger declared in main.go
 )
 
 // Function to scan all Traefik routers and create DNS aliases for them
-// This function will handle routes from file-based configs or other non-Docker sources
+// This function handles routes from ALL sources, including:
+// - Docker container labels
+// - File-based configurations
+// - Other providers (e.g., Kubernetes CRDs if Traefik is running in a Kubernetes cluster)
 func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) error {
 	// Log what we're doing
-	log.Println("Scanning all Traefik routes for Host rules...")
+	logger.Debug().Msg("Scanning all Traefik routes for Host rules...")
 
 	// Fetch all routers from Traefik API
 	routers, err := fetchTraefikRouters()
@@ -20,18 +24,31 @@ func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) e
 		return fmt.Errorf("failed to fetch Traefik routers: %w", err)
 	}
 
-	log.Printf("Found %d total Traefik routers", len(routers))
+	logger.Debug().Int("count", len(routers)).Msg("Found Traefik routers")
 
 	// Track statistics
 	var aliasCount int
 	var skipCount int
 	aliasMap := make(map[string]struct{}) // Use a map to track unique aliases
+	
+	// Get existing aliases to clean up stale ones later
+	existingAliases, err := opnsenseClient.GetAllAliases()
+	if err != nil {
+		logger.Warn().Err(err).Msg("Failed to fetch existing aliases for cleanup")
+	}
 
 	// Process each router
 	for _, router := range routers {
+		// Skip disabled routers
+		if router.Status != "enabled" {
+			logger.Debug().Str("router", router.Name).Msg("Skipping disabled router")
+			skipCount++
+			continue
+		}
+
 		// Skip routers without Host rules
 		if !strings.Contains(router.Rule, "Host(") {
-			log.Printf("Skipping router %s: No Host rule found", router.Name)
+			logger.Debug().Str("router", router.Name).Msg("Skipping router: No Host rule found")
 			skipCount++
 			continue
 		}
@@ -39,46 +56,75 @@ func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) e
 		// Extract FQDN from router rule
 		fqdn := extractFQDN(router.Rule)
 		if fqdn == "" {
-			log.Printf("Skipping router %s: Could not extract FQDN from rule: %s", router.Name, router.Rule)
+			logger.Debug().Str("router", router.Name).Str("rule", router.Rule).Msg("Skipping router: Could not extract FQDN from rule")
 			skipCount++
 			continue
 		}
 
 		// Skip if we've already processed this FQDN
 		if _, exists := aliasMap[fqdn]; exists {
-			log.Printf("Skipping duplicate FQDN: %s", fqdn)
+			logger.Debug().Str("fqdn", fqdn).Msg("Skipping duplicate FQDN")
 			skipCount++
 			continue
 		}
 
 		// Add to our tracking map
 		aliasMap[fqdn] = struct{}{}
+		
+		// Log the provider for informational purposes
+		if router.Provider == "file" || strings.HasPrefix(router.Provider, "kubernetes") {
+			// For file-based configurations or k8s, we want to provide more detailed logging
+			logger.Debug().Str("router", router.Name).Str("fqdn", fqdn).Str("provider", router.Provider).Msg("Found non-docker router with Host rule")
+		}
 
 		// Check if this is an internal service (no need for DNS alias)
 		if strings.HasSuffix(fqdn, ".internal") || strings.HasSuffix(fqdn, ".local") {
-			log.Printf("Skipping internal service FQDN: %s", fqdn)
+			logger.Debug().Str("fqdn", fqdn).Msg("Skipping internal service FQDN")
 			skipCount++
 			continue
 		}
 
-		// Create the alias in OPNsense
-		log.Printf("Creating alias for Traefik route: %s (Router: %s)", fqdn, router.Name)
-		if err := opnsenseClient.CreateAlias(fqdn, defaultProxyHostUUID); err != nil {
-			log.Printf("WARNING: Failed to create alias for %s: %v", fqdn, err)
+		// Queue the alias creation (without reconfiguring each time)
+		logger.Debug().Str("fqdn", fqdn).Str("router", router.Name).Str("provider", router.Provider).Str("service", router.Service).Msg("Queueing alias for Traefik route")
+		if err := opnsenseClient.CreateAlias(fqdn, defaultProxyHostUUID, router.Provider, router.Service); err != nil {
+			logger.Warn().Err(err).Str("fqdn", fqdn).Msg("Failed to create alias")
 			continue
 		}
 
 		aliasCount++
 	}
 
-	// Apply changes if we created any aliases
-	if aliasCount > 0 {
-		log.Printf("Created %d aliases from Traefik routers (skipped %d)", aliasCount, skipCount)
-		if err := opnsenseClient.Reconfigure(); err != nil {
-			return fmt.Errorf("failed to reconfigure Unbound after creating aliases: %w", err)
+	// Clean up stale aliases (those that no longer have a corresponding router)
+	var deletedCount int
+	if existingAliases != nil {
+		for fqdn := range existingAliases {
+			// Skip if this alias is still valid (exists in our current router set)
+			if _, exists := aliasMap[fqdn]; exists {
+				continue
+			}
+			
+			// This alias no longer has a corresponding router, delete it
+			logger.Debug().Str("fqdn", fqdn).Msg("Deleting stale alias without matching router")
+			if err := opnsenseClient.DeleteAlias(fqdn); err != nil {
+				logger.Warn().Err(err).Str("fqdn", fqdn).Msg("Failed to delete stale alias")
+			} else {
+				deletedCount++
+			}
 		}
+	}
+	
+	// Only reconfigure once after all aliases have been processed (created and deleted)
+	needsReconfigure := aliasCount > 0 || deletedCount > 0
+	
+	if needsReconfigure {
+		logger.Info().Int("created", aliasCount).Int("deleted", deletedCount).Int("skipped", skipCount).Msg("Processed Traefik router aliases")
+		logger.Debug().Msg("Reconfiguring Unbound with all alias changes...")
+		if err := opnsenseClient.Reconfigure(); err != nil {
+			return fmt.Errorf("failed to reconfigure Unbound after processing aliases: %w", err)
+		}
+		logger.Debug().Msg("Unbound reconfiguration complete")
 	} else {
-		log.Printf("No new aliases created from Traefik routes (skipped %d)", skipCount)
+		logger.Info().Int("skipped", skipCount).Msg("No alias changes needed")
 	}
 
 	return nil
@@ -89,11 +135,11 @@ func startTraefikRoutesScanner(ctx context.Context, opnsenseClient *OpnsenseClie
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Printf("Starting Traefik routes scanner with interval: %v", interval)
+	logger.Info().Dur("interval", interval).Msg("Starting Traefik routes scanner")
 
 	// Scan immediately on startup
 	if err := scanAllTraefikRoutes(ctx, opnsenseClient); err != nil {
-		log.Printf("ERROR: Failed to scan Traefik routes: %v", err)
+		logger.Error().Err(err).Msg("Failed to scan Traefik routes")
 	}
 
 	// Then scan periodically
@@ -101,10 +147,10 @@ func startTraefikRoutesScanner(ctx context.Context, opnsenseClient *OpnsenseClie
 		select {
 		case <-ticker.C:
 			if err := scanAllTraefikRoutes(ctx, opnsenseClient); err != nil {
-				log.Printf("ERROR: Failed to scan Traefik routes: %v", err)
+				logger.Error().Err(err).Msg("Failed to scan Traefik routes")
 			}
 		case <-ctx.Done():
-			log.Println("Traefik routes scanner stopped")
+			logger.Debug().Msg("Traefik routes scanner stopped")
 			return
 		}
 	}

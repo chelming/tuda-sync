@@ -6,8 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io" 
-	"log"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -64,13 +63,13 @@ func NewOpnsenseClient(protocol, host, key, secret string, insecure bool) *Opnse
 		aliasCache: make(map[string]string),
 	}
 	
-	log.Printf("DEBUG: OPNsense API base URL: %s", client.url)
+	logger.Debug().Str("baseUrl", client.url).Msg("OPNsense API base URL")
 	
 	// Pre-populate cache from existing records
 	err := client.loadHostAliasesIntoCache()
 	if err != nil {
-		log.Printf("WARNING: Failed to load existing host aliases into cache: %v", err)
-		log.Println("Continuing with empty cache. This may cause duplicate alias issues.")
+		logger.Warn().Err(err).Msg("Failed to load existing host aliases into cache")
+		logger.Warn().Msg("Continuing with empty cache. This may cause duplicate alias issues")
 	}
 	
 	return client
@@ -104,7 +103,7 @@ func (o *OpnsenseClient) makeRequest(method, endpoint string, payload interface{
 		fullURL += "/"
 	}
 
-	log.Printf("DEBUG: Making %s request to %s", method, fullURL)
+	logger.Debug().Str("method", method).Str("url", fullURL).Msg("Making request")
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
@@ -128,9 +127,8 @@ func (o *OpnsenseClient) makeRequest(method, endpoint string, payload interface{
 	if resp.StatusCode != http.StatusOK {
 		// Print the beginning of the response to help with debugging
 		previewLen := min(len(respBody), 150)
-		log.Printf("ERROR: API call failed. Status: %s. Response body start: %s", 
-            resp.Status, string(respBody)[:previewLen]) 
-        
+		previewText := string(respBody[:previewLen])
+		logger.Error().Str("status", resp.Status).Str("response", previewText).Msg("API call failed")
 		return nil, fmt.Errorf("API request failed with HTTP status: %s", resp.Status)
 	}
 
@@ -141,14 +139,17 @@ func (o *OpnsenseClient) makeRequest(method, endpoint string, payload interface{
 	if err := json.NewDecoder(bytes.NewReader(respBody)).Decode(&result); err != nil {
         // Print the beginning of the response to help with debugging
         previewLen := min(len(respBody), 150)
-        log.Printf("DEBUG: Failed to decode JSON. Raw response start: %s", string(respBody)[:previewLen])
+        logger.Debug().Str("response", string(respBody)[:previewLen]).Msg("Failed to decode JSON")
         
         return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	// This check catches JSON responses that contain an explicit API failure message.
-	// Accept both "OK" and "saved" as valid results
-	if result["result"] != nil && result["result"] != "OK" && result["result"] != "saved" {
+	// Accept "OK", "saved", and "deleted" as valid results
+	if result["result"] != nil && 
+	   result["result"] != "OK" && 
+	   result["result"] != "saved" && 
+	   result["result"] != "deleted" {
 		return nil, fmt.Errorf("OPNsense API reported failure: %v", result)
 	}
 
@@ -157,7 +158,7 @@ func (o *OpnsenseClient) makeRequest(method, endpoint string, payload interface{
 
 // loadHostAliasesIntoCache fetches all host aliases from OPNsense and adds them to the cache
 func (o *OpnsenseClient) loadHostAliasesIntoCache() error {
-	log.Println("Loading existing host aliases into cache...")
+	logger.Debug().Msg("Loading existing host aliases into cache...")
 
 	// Use the specific search payload structure required by OPNsense
 	payload := map[string]interface{}{
@@ -205,13 +206,13 @@ func (o *OpnsenseClient) loadHostAliasesIntoCache() error {
 		count++
 	}
 	
-	log.Printf("Loaded %d host aliases into cache", count)
+	logger.Debug().Int("count", count).Msg("Loaded host aliases into cache")
 	return nil
 }
 
 // ListHostOverrides fetches and prints all configured Host Overrides (Host, Domain, IP, UUID).
 func (o *OpnsenseClient) ListHostOverrides() error {
-	log.Println("Fetching Unbound Host Overrides from OPNsense...")
+	logger.Info().Msg("Fetching Unbound Host Overrides from OPNsense...")
 
 	// Use the specific search payload structure required by OPNsense
 	payload := map[string]interface{}{
@@ -231,7 +232,7 @@ func (o *OpnsenseClient) ListHostOverrides() error {
 		return fmt.Errorf("failed to parse host overrides list: expected 'rows' key")
 	}
 
-	log.Println("\n--- OPNsense Unbound Host Overrides ---")
+	logger.Info().Msg("\n--- OPNsense Unbound Host Overrides ---")
 	// Header: UUID | ENABLED | HOST.DOMAIN | IP ADDRESS
     fmt.Printf("%-40s | %-8s | %-30s | %s\n", "UUID", "ENABLED", "HOST.DOMAIN", "IP ADDRESS")
 	// Separator line must match the width of the header (101 characters wide)
@@ -246,7 +247,7 @@ func (o *OpnsenseClient) ListHostOverrides() error {
 		// Use safe comma-ok idiom and correct JSON keys (hostname, server)
 		uuid, ok := hostMap["uuid"].(string)
 		if !ok {
-			log.Println("WARNING: Skipping Host Override record due to missing or invalid 'uuid'.")
+			logger.Warn().Msg("Skipping Host Override record due to missing or invalid 'uuid'")
 			continue
 		}
 		
@@ -282,7 +283,7 @@ func (o *OpnsenseClient) ListHostOverrides() error {
 // ClearAllAliases fetches all currently configured Unbound Aliases and deletes them.
 // This is intended to run on service startup to prevent stale entries.
 func (o *OpnsenseClient) ClearAllAliases() error {
-	log.Println("Clearing all existing Unbound Aliases...")
+	logger.Info().Msg("Clearing all existing Unbound Aliases...")
 
 	// 1. Get the list of all aliases
 	payload := map[string]interface{}{
@@ -299,11 +300,11 @@ func (o *OpnsenseClient) ClearAllAliases() error {
 	// 2. Extract UUIDs from the aliases list
 	aliases, ok := result["rows"].([]interface{})
 	if !ok || len(aliases) == 0 {
-		log.Println("No aliases found to clear.")
+		logger.Debug().Msg("No aliases found to clear")
 		return nil
 	}
 	
-	log.Printf("Found %d existing alias(es). Deleting...", len(aliases))
+	logger.Debug().Int("count", len(aliases)).Msg("Found existing aliases. Deleting...")
 
 	// 3. Iterate and delete each alias by UUID
 	for _, item := range aliases {
@@ -317,11 +318,11 @@ func (o *OpnsenseClient) ClearAllAliases() error {
 		// OPNsense expects the UUID in the URL path, not the request body
 		_, err := o.makeRequest(http.MethodPost, "del_host_alias/"+uuid, map[string]interface{}{})
 		if err != nil {
-			log.Printf("WARNING: Failed to delete alias with UUID %s: %v", uuid, err)
+			logger.Warn().Str("uuid", uuid).Err(err).Msg("Failed to delete alias")
 		} else {
 			hostname, _ := aliasMap["hostname"].(string)
 			domain, _ := aliasMap["domain"].(string)
-			log.Printf("Deleted alias: %s.%s (UUID: %s)", hostname, domain, uuid)
+			logger.Debug().Str("hostname", hostname).Str("domain", domain).Str("uuid", uuid).Msg("Deleted alias")
 			
 			// Remove from cache if present
 			fqdn := hostname + "." + domain
@@ -334,20 +335,30 @@ func (o *OpnsenseClient) ClearAllAliases() error {
         return fmt.Errorf("failed to reconfigure Unbound after clearing aliases: %w", err)
     }
 
-	log.Println("Alias clearing complete.")
+	logger.Debug().Msg("Alias clearing complete")
 	return nil
 }
 
 
 // CreateAlias adds a new alias, linked to the specified Host Override UUID
-func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string) error {
+func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider string, service string) error {
 	host, domain := splitFQDN(fqdn)
 	
 	// Check if this alias already exists (to avoid duplicates)
 	existingUUID, exists := o.getCachedAlias(fqdn)
 	if exists {
-		log.Printf("Alias for %s already exists with UUID %s, skipping creation", fqdn, existingUUID)
+		logger.Debug().Str("fqdn", fqdn).Str("uuid", existingUUID).Msg("Alias already exists, skipping creation")
 		return nil
+	}
+	
+	// Generate a descriptive comment with provider and service info if available
+	description := "Auto-generated by tuda-sync"
+	if provider != "" {
+		if service != "" {
+			description = fmt.Sprintf("Provider: %s, Service: %s", provider, service)
+		} else {
+			description = fmt.Sprintf("Provider: %s", provider)
+		}
 	}
 	
 	// Based on the curl example, the correct payload structure is:
@@ -357,11 +368,11 @@ func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string) error {
 			"host": proxyHostUUID, // This is the Host Override UUID
 			"hostname": host,    // The hostname part of the FQDN
 			"domain": domain,    // The domain part of the FQDN
-			"description": fmt.Sprintf("Auto-generated for %s", fqdn),
+			"description": description,
 		},
 	}
 	
-	log.Printf("DEBUG: Creating alias with payload: %+v", payload["alias"])
+	logger.Debug().Interface("payload", payload["alias"]).Msg("Creating alias")
 	
 	// Use the add_host_alias endpoint as seen in the curl example
 	response, err := o.makeRequest(http.MethodPost, "add_host_alias", payload)
@@ -378,21 +389,81 @@ func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string) error {
 	// Extract UUID from the response
 	if uuid, ok := response["uuid"].(string); ok && uuid != "" {
 		o.setCachedAlias(fqdn, uuid)
-		log.Printf("Added alias %s with UUID %s to cache", fqdn, uuid)
+		logger.Debug().Str("fqdn", fqdn).Str("uuid", uuid).Msg("Added alias to cache")
 	} else if savedData, ok := response["saved"]; ok && savedData != nil {
 		// Some OPNsense versions might return different response format
-		log.Printf("Alias created for %s, but no UUID was returned. Using FQDN as cache key.", fqdn)
+		logger.Warn().Str("fqdn", fqdn).Msg("Alias created but no UUID returned. Using FQDN as cache key")
 		o.setCachedAlias(fqdn, fqdn) // Use FQDN as a placeholder UUID
 	} else {
-		log.Printf("WARNING: Created alias for %s but could not extract UUID from response: %v", fqdn, response)
+		logger.Warn().Str("fqdn", fqdn).Interface("response", response).Msg("Created alias but could not extract UUID from response")
 	}
 	
 	return nil
 }
 
+// GetAllAliases returns a map of all existing aliases (FQDN -> UUID)
+func (o *OpnsenseClient) GetAllAliases() (map[string]string, error) {
+	// Prepare request payload
+	payload := map[string]interface{}{
+		"current": 1,
+		"rowCount": 500,
+		"sort": map[string]interface{}{},
+	}
+	
+	// Fetch all aliases from the API
+	result, err := o.makeRequest(http.MethodPost, "search_host_alias", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search host aliases: %w", err)
+	}
+	
+	// Parse the result
+	aliases, ok := result["rows"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("failed to parse aliases list")
+	}
+	
+	// Build a map of FQDN -> UUID
+	aliasMap := make(map[string]string)
+	for _, item := range aliases {
+		aliasData, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		
+		hostname, hostOk := aliasData["hostname"].(string)
+		domain, domainOk := aliasData["domain"].(string)
+		uuid, uuidOk := aliasData["uuid"].(string)
+		
+		if hostOk && domainOk && uuidOk {
+			fqdn := hostname + "." + domain
+			aliasMap[fqdn] = uuid
+			
+			// Update our cache
+			o.setCachedAlias(fqdn, uuid)
+		}
+	}
+	
+	logger.Debug().Int("count", len(aliasMap)).Msg("Retrieved current aliases")
+	return aliasMap, nil
+}
+
 // DeleteAlias is complex, requiring a lookup for the alias's UUID first.
 func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
-	// 1. Get the list of all host aliases
+	// 1. Check cache first for the UUID
+	if cachedUUID, exists := o.getCachedAlias(fqdn); exists {
+		// Attempt to delete using cached UUID
+		_, err := o.makeRequest(http.MethodPost, "del_host_alias/"+cachedUUID, map[string]interface{}{})
+		if err == nil {
+			// Success - remove from cache
+			o.removeCachedAlias(fqdn)
+			logger.Debug().Str("fqdn", fqdn).Str("uuid", cachedUUID).Msg("Deleted alias using cached UUID")
+			return nil
+		}
+		// If we get here, the cached UUID was invalid, fall back to lookup
+		logger.Debug().Str("fqdn", fqdn).Str("uuid", cachedUUID).Msg("Cached UUID failed, falling back to lookup")
+	}
+
+	// 2. If no cache hit or cache failed, get the list of all host aliases
 	payload := map[string]interface{}{
 		"current": 1,
 		"rowCount": 500,
@@ -404,7 +475,7 @@ func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
 		return fmt.Errorf("failed to search host aliases: %w", err)
 	}
 	
-	// 2. Find the UUID of the alias matching the FQDN (search endpoints use "rows")
+	// 3. Find the UUID of the alias matching the FQDN (search endpoints use "rows")
 	aliases, ok := result["rows"].([]interface{})
 	if !ok {
 		return fmt.Errorf("failed to parse aliases list")
@@ -430,7 +501,7 @@ func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
 	}
 	
 	if targetUUID == "" {
-		log.Printf("Alias %s not found in OPNsense configuration. Assuming already deleted.", fqdn)
+		logger.Debug().Str("fqdn", fqdn).Msg("Alias not found in OPNsense configuration. Assuming already deleted")
 		return nil // Not found, treat as success
 	}
 
@@ -448,7 +519,7 @@ func (o *OpnsenseClient) DeleteAlias(fqdn string) error {
 
 // Reconfigure restarts the Unbound service to apply changes
 func (o *OpnsenseClient) Reconfigure() error {
-	log.Println("Applying changes by reconfiguring Unbound...")
+	logger.Debug().Msg("Applying changes by reconfiguring Unbound...")
 	
 	// Create context with timeout for the request
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -458,7 +529,7 @@ func (o *OpnsenseClient) Reconfigure() error {
 	serviceURL := strings.Replace(o.url, "/settings", "/service", 1)
 	fullURL := serviceURL + "/reconfigure"
 	
-	log.Printf("DEBUG: Making POST request to %s", fullURL)
+	logger.Debug().Str("url", fullURL).Msg("Making POST request")
 	
 	body, _ := json.Marshal(map[string]interface{}{})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewBuffer(body))
@@ -478,12 +549,11 @@ func (o *OpnsenseClient) Reconfigure() error {
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		previewLen := min(len(respBody), 150)
-		log.Printf("ERROR: Reconfigure API call failed. Status: %s. Response body start: %s", 
-            resp.Status, string(respBody)[:previewLen])
+		logger.Error().Str("status", resp.Status).Str("response", string(respBody)[:previewLen]).Msg("Reconfigure API call failed")
 		return fmt.Errorf("failed to reconfigure Unbound: API request failed with HTTP status: %s", resp.Status)
 	}
 	
-	log.Println("Unbound reconfigured successfully.")
+	logger.Info().Msg("Unbound reconfigured successfully")
 	return nil
 }
 
@@ -566,6 +636,6 @@ func (o *OpnsenseClient) checkHostOverrideExists(uuid string) (bool, error) {
 	}
 	
 	// No matching UUID found
-	log.Printf("WARNING: Host override with UUID %s not found in OPNsense", uuid)
+	logger.Warn().Str("uuid", uuid).Msg("Host override not found in OPNsense")
 	return false, nil
 }
