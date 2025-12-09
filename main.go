@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,7 +37,6 @@ var (
 	opnsenseSecret string
 	opnsenseInsecure bool
 	opnsenseProtocol string
-	
 	defaultProxyHostUUID string
 	baseDomain           string
 	
