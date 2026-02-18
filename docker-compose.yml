@@ -29,6 +29,10 @@ services:
       - TRAEFIK_USE_API=true                     # Enable Traefik API integration
       - TRAEFIK_API_USERNAME=                    # Optional: Username for Traefik API basic auth
       - TRAEFIK_API_PASSWORD=                    # Optional: Password for Traefik API basic auth
+      
+      # --- Startup Configuration ---
+      - STARTUP_SCAN_DELAY=10s                   # Wait for Traefik to initialize (increase if needed)
+      
       # Multiple traefik instances support
       # Format: label:domain,label2:domain2
       # - TRAEFIK_INSTANCES=traefik.primary.enable:example.com,traefik.secondary.enable:internal.example.com

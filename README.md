@@ -132,6 +132,7 @@ The application is configured exclusively using **environment variables**, which
 | **`DEBUG_CACHE`** | **`false`** | **NEW:** Set to `true` to enable cache operation debugging. |
 | **`SCAN_ALL_ROUTES`** | **`false`** | **NEW:** Set to `true` to scan all Traefik routes (including file-based configs) periodically. |
 | **`ROUTE_SCAN_INTERVAL`** | **`5m`** | **NEW:** Interval for scanning all Traefik routes when SCAN_ALL_ROUTES is enabled. |
+| **`STARTUP_SCAN_DELAY`** | **`10s`** | **NEW:** Delay before initial Traefik scan on startup to allow Traefik to fully initialize. Increase if routes are missing on first scan. |
 | **`DELAYED_ROUTER_CHECKS`** | **`false`** | **NEW:** Set to `true` to enable delayed router checks after container start. |
 | **`DELAYED_CHECK_INITIAL_DELAY`** | **`5s`** | **NEW:** Initial delay before first check after container start. |
 | **`DELAYED_CHECK_MAX_DELAY`** | **`60s`** | **NEW:** Maximum delay between checks. |

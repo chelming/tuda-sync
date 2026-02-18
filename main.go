@@ -62,6 +62,7 @@ var (
 	scanOnly bool
 	scanAllRoutes bool
 	routeScanInterval time.Duration
+	startupScanDelay time.Duration // Delay before initial Traefik scan on startup
 	
 	// Delayed router check configuration
 	delayedRouterChecks DelayedCheckOptions
@@ -183,6 +184,7 @@ func init() {
 	flag.BoolVar(&scanOnly, "scan-only", getEnvBool("SCAN_ONLY"), "If set, only scans existing containers and exits. (Env: SCAN_ONLY=true)")
 	flag.BoolVar(&scanAllRoutes, "scan-all-routes", getEnvBool("SCAN_ALL_ROUTES"), "Scan all Traefik routes (including file-based configs). (Env: SCAN_ALL_ROUTES=true)")
 	flag.DurationVar(&routeScanInterval, "route-scan-interval", getEnvDuration("ROUTE_SCAN_INTERVAL", 5*time.Minute), "How often to scan all Traefik routes. (Env: ROUTE_SCAN_INTERVAL, default: 5m)")
+	flag.DurationVar(&startupScanDelay, "startup-scan-delay", getEnvDuration("STARTUP_SCAN_DELAY", 10*time.Second), "Delay before initial Traefik scan on startup to allow Traefik to initialize. (Env: STARTUP_SCAN_DELAY, default: 10s)")
 	
 	// 5. Delayed router check configuration
 	flag.BoolVar(&enableDelayedChecks, "delayed-checks", getEnvBool("DELAYED_ROUTER_CHECKS"), "Whether to perform delayed checks for new routers after container start. (Env: DELAYED_ROUTER_CHECKS=true)")
@@ -380,6 +382,12 @@ func runDockerMonitor(opnsenseClient *OpnsenseClient) {
 
 	logger.Info().Msg("Successfully connected to Docker and OPNsense. Monitoring for Traefik containers...")
 	logger.Info().Str("domain", baseDomain).Str("proxyUUID", defaultProxyHostUUID).Msg("Configuration")
+	
+	// Wait for Traefik to initialize before scanning
+	if startupScanDelay > 0 {
+		logger.Info().Dur("delay", startupScanDelay).Msg("Waiting for Traefik to initialize before initial scan...")
+		time.Sleep(startupScanDelay)
+	}
 	
 	// Scan Traefik routes and create DNS entries for them
 	if err := initialTraefikScan(ctx, opnsenseClient); err != nil {
