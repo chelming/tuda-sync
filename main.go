@@ -111,7 +111,7 @@ var logger zerolog.Logger
 
 func init() {
 	// Configure structured logging
-	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
+	zerolog.TimeFieldFormat = time.RFC3339
 	
 	// Set log level from environment variable (if provided)
 	// Possible values: trace, debug, info, warn, error, fatal, panic
@@ -145,7 +145,13 @@ func init() {
 	zerolog.SetGlobalLevel(level)
 	
 	// Create logger with console output
-	logger = zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().Logger()
+	logger = zerolog.New(zerolog.ConsoleWriter{
+		Out:        os.Stdout,
+		TimeFormat: "15:04:05",
+		FormatTimestamp: func(i interface{}) string {
+			return fmt.Sprintf("\033[0m%s\033[0m", i)
+		},
+	}).With().Timestamp().Logger()
 	
 	// Override standard logger to use zerolog
 	log.SetFlags(0)
