@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -256,9 +257,32 @@ func cleanupExpiredCaches() {
 func main() {
 	// Command parsing
 	flag.Parse()
-	
+
 	// The first argument not consumed by flags is treated as a command
 	command := flag.Arg(0)
+
+	// --- Handle 'help' command (no credentials needed) ---
+	if command == "help" || command == "--help" || command == "-h" {
+		fmt.Println("tuda-sync - Traefik/Unbound/Docker/Alias Synchronization")
+		fmt.Println()
+		fmt.Println("Usage: tuda-sync <command>")
+		fmt.Println()
+		fmt.Println("Commands:")
+		fmt.Println("  (none)    Run the main monitor loop (default)")
+		fmt.Println("  help      Show this help message")
+		fmt.Println("  list      Show host overrides with their child aliases (tree view)")
+		fmt.Println("  aliases   List all DNS aliases on OPNsense")
+		fmt.Println("  diff      Compare Traefik routes vs OPNsense aliases")
+		fmt.Println("  scan      Scan Traefik and create missing aliases (non-destructive)")
+		fmt.Println("  scan-routes  Full scan with cleanup of stale aliases")
+		fmt.Println("  resync    Clear managed aliases and rebuild them from Traefik")
+		fmt.Println()
+		fmt.Println("Examples:")
+		fmt.Println("  docker exec tuda-sync tuda-sync list")
+		fmt.Println("  docker exec tuda-sync tuda-sync diff")
+		fmt.Println("  docker exec tuda-sync tuda-sync resync")
+		return
+	}
 
 	// Validate required credentials
 	if opnsenseHost == "" || opnsenseKey == "" || opnsenseSecret == "" {
@@ -271,26 +295,144 @@ func main() {
 	// Initialize OPNsense Client (Assumes opnsense_api.go exists)
 	opnsenseClient := NewOpnsenseClient(opnsenseProtocol, opnsenseHost, opnsenseKey, opnsenseSecret, opnsenseInsecure)
 
-	// Start a simple HTTP server for health checks and metrics
-	go func() {
-		http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("OK"))
-		})
-		http.Handle("/metrics", promhttp.Handler())
-		
-		serverAddr := ":8080"
-		logger.Info().Str("address", serverAddr).Msg("Starting health and metrics server")
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
-			logger.Error().Err(err).Msg("Health/metrics server error")
-		}
-	}()
-
 	// --- Handle 'list' command ---
 	if command == "list" {
-		if err := opnsenseClient.ListHostOverrides(); err != nil {
-			logger.Fatal().Err(err).Msg("Failed to list host overrides")
+		if err := opnsenseClient.ListAll(); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to list DNS entries")
 		}
+		return
+	}
+
+	// --- Handle 'aliases' command ---
+	if command == "aliases" {
+		if err := opnsenseClient.ListAliases(); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to list aliases")
+		}
+		return
+	}
+
+	// --- Handle 'diff' command ---
+	if command == "diff" {
+		logger.Info().Msg("Comparing Traefik routes vs OPNsense aliases...")
+
+		// Fetch Traefik routers
+		routers, err := fetchTraefikRouters()
+		if err != nil {
+			logger.Fatal().Err(err).Msg("Failed to fetch Traefik routers")
+		}
+
+		// Build set of FQDNs from Traefik
+		traefikFQDNs := make(map[string]struct{})
+		for _, router := range routers {
+			if router.Status != "enabled" {
+				continue
+			}
+			if !strings.Contains(router.Rule, "Host(") {
+				continue
+			}
+			fqdn := extractFQDN(router.Rule)
+			if fqdn == "" {
+				continue
+			}
+			if strings.HasSuffix(fqdn, ".internal") || strings.HasSuffix(fqdn, ".local") {
+				continue
+			}
+			traefikFQDNs[fqdn] = struct{}{}
+		}
+
+		// Fetch OPNsense aliases
+		opnsenseFQDNs, err := opnsenseClient.GetAliasesForDiff()
+		if err != nil {
+			logger.Fatal().Err(err).Msg("Failed to fetch OPNsense aliases")
+		}
+
+		// Find differences
+		var onlyInTraefik []string
+		var onlyInOpnsense []string
+		var inBoth []string
+
+		for fqdn := range traefikFQDNs {
+			if _, exists := opnsenseFQDNs[fqdn]; exists {
+				inBoth = append(inBoth, fqdn)
+			} else {
+				onlyInTraefik = append(onlyInTraefik, fqdn)
+			}
+		}
+		for fqdn := range opnsenseFQDNs {
+			if _, exists := traefikFQDNs[fqdn]; !exists {
+				onlyInOpnsense = append(onlyInOpnsense, fqdn)
+			}
+		}
+
+		// Sort for deterministic output
+		sort.Strings(onlyInTraefik)
+		sort.Strings(onlyInOpnsense)
+		sort.Strings(inBoth)
+
+		// Print results
+		fmt.Println("\n--- Diff: Traefik routes vs OPNsense aliases ---")
+		fmt.Printf("Traefik routes: %d | OPNsense aliases: %d | In both: %d\n",
+			len(traefikFQDNs), len(opnsenseFQDNs), len(inBoth))
+
+		if len(onlyInTraefik) > 0 {
+			fmt.Println("\nMissing from OPNsense (should be created):")
+			for _, fqdn := range onlyInTraefik {
+				fmt.Printf("  + %s\n", fqdn)
+			}
+		}
+
+		if len(onlyInOpnsense) > 0 {
+			fmt.Println("\nStale on OPNsense (no matching Traefik route):")
+			for _, fqdn := range onlyInOpnsense {
+				fmt.Printf("  - %s\n", fqdn)
+			}
+		}
+
+		if len(onlyInTraefik) == 0 && len(onlyInOpnsense) == 0 {
+			fmt.Println("\nAll routes are in sync!")
+		}
+
+		fmt.Printf("\nSync status: %s\n", func() string {
+			if len(onlyInTraefik) == 0 && len(onlyInOpnsense) == 0 {
+				return "IN SYNC"
+			}
+			return "OUT OF SYNC"
+		}())
+
+		return
+	}
+
+	// --- Handle 'resync' command ---
+	if command == "resync" {
+		// Clearing and rebuilding are both scoped to this host override, so it
+		// has to be configured before we touch anything.
+		if defaultProxyHostUUID == "" {
+			logger.Fatal().Msg("DEFAULT_PROXY_HOST_UUID environment variable or --proxy-uuid flag is required to resync")
+		}
+
+		logger.Info().Str("proxyUUID", defaultProxyHostUUID).Msg("Starting full re-sync of managed aliases...")
+
+		// Step 1: Clear the aliases linked to our host override
+		logger.Info().Msg("Step 1/3: Clearing managed aliases...")
+		if err := opnsenseClient.ClearManagedAliases(defaultProxyHostUUID); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to clear aliases")
+		}
+
+		// Step 2: Invalidate Traefik cache
+		logger.Info().Msg("Step 2/3: Invalidating Traefik router cache...")
+		traefikRouterCache.mutex.Lock()
+		traefikRouterCache.routers = nil
+		traefikRouterCache.lastFetched = time.Time{}
+		traefikRouterCache.mutex.Unlock()
+
+		// Step 3: Rebuild from Traefik
+		logger.Info().Msg("Step 3/3: Rebuilding aliases from Traefik routes...")
+		ctx := context.Background()
+		if err := scanAllTraefikRoutes(ctx, opnsenseClient); err != nil {
+			logger.Fatal().Err(err).Msg("Failed to rebuild aliases")
+		}
+
+		logger.Info().Msg("Full re-sync complete")
 		return
 	}
 
@@ -316,6 +458,21 @@ func main() {
 
 	// --- Handle main monitor loop ---
 	if command == "" {
+		// Start a simple HTTP server for health checks and metrics
+		go func() {
+			http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("OK"))
+			})
+			http.Handle("/metrics", promhttp.Handler())
+
+			serverAddr := ":8080"
+			logger.Info().Str("address", serverAddr).Msg("Starting health and metrics server")
+			if err := http.ListenAndServe(serverAddr, nil); err != nil {
+				logger.Error().Err(err).Msg("Health/metrics server error")
+			}
+		}()
+
 		// Create a parent context that we can cancel on shutdown
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -375,7 +532,7 @@ func runDockerMonitor(opnsenseClient *OpnsenseClient) {
 	// 1. Initial Cleanup
 	if clearOnStart {
 		logger.Info().Msg("Clearing existing DNS aliases...")
-		if err := opnsenseClient.ClearAllAliases(); err != nil {
+		if err := opnsenseClient.ClearManagedAliases(defaultProxyHostUUID); err != nil {
 			logger.Fatal().Err(err).Msg("Fatal error during alias cleanup")
 		}
 	}

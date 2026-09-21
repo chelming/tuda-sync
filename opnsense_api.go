@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -250,23 +251,23 @@ func (o *OpnsenseClient) ListHostOverrides() error {
 			logger.Warn().Msg("Skipping Host Override record due to missing or invalid 'uuid'")
 			continue
 		}
-		
+
 		host, ok := hostMap["hostname"].(string)
 		if !ok { continue }
 
-		domain, ok := hostMap["domain"].(string) 
+		domain, ok := hostMap["domain"].(string)
 		if !ok { continue }
-		
+
 		ip, ok := hostMap["server"].(string)
 		if !ok { continue }
-		
+
 		// Determine status using symbols
 		enabled, _ := hostMap["enabled"].(string)
-		rawStatus := "✓" 
+		rawStatus := "✓"
 		if enabled != "1" {
 			rawStatus = "x"
 		}
-        
+
         // Center the status symbol (1 character) within the 8-character column.
         centeredStatus := fmt.Sprintf("   %s    ", rawStatus)
 
@@ -274,71 +275,235 @@ func (o *OpnsenseClient) ListHostOverrides() error {
 		// Print the row
 		fmt.Printf("%-40s | %s | %-30s | %s\n", uuid, centeredStatus, fmt.Sprintf("%s.%s", host, domain), ip)
 	}
-	
+
 	// Print the final separator without a timestamp.
 	fmt.Println(strings.Repeat("-", 101))
 	return nil
 }
 
-// ClearAllAliases fetches all currently configured Unbound Aliases and deletes them.
-// This is intended to run on service startup to prevent stale entries.
-func (o *OpnsenseClient) ClearAllAliases() error {
-	logger.Info().Msg("Clearing all existing Unbound Aliases...")
+// ListAll shows host overrides with their child aliases in a tree format.
+func (o *OpnsenseClient) ListAll() error {
+	logger.Info().Msg("Fetching Unbound Host Overrides and Aliases from OPNsense...")
+
+	// Fetch host overrides
+	overridePayload := map[string]interface{}{
+		"current":  1,
+		"rowCount": 100,
+		"sort":     map[string]interface{}{},
+	}
+	overrideResult, err := o.makeRequest(http.MethodPost, "search_host_override", overridePayload)
+	if err != nil {
+		return fmt.Errorf("failed to fetch host overrides: %w", err)
+	}
+	overridesData, ok := overrideResult["rows"].([]interface{})
+	if !ok {
+		return fmt.Errorf("failed to parse host overrides list")
+	}
+
+	// Fetch aliases
+	aliasPayload := map[string]interface{}{
+		"current":  1,
+		"rowCount": 500,
+		"sort":     map[string]interface{}{},
+	}
+	aliasResult, err := o.makeRequest(http.MethodPost, "search_host_alias", aliasPayload)
+	if err != nil {
+		return fmt.Errorf("failed to fetch aliases: %w", err)
+	}
+	aliasesData, ok := aliasResult["rows"].([]interface{})
+	if !ok {
+		return fmt.Errorf("failed to parse aliases list")
+	}
+
+	// Build a map of override UUID -> override info
+	type OverrideInfo struct {
+		UUID   string
+		Host   string
+		Domain string
+		IP     string
+		Enabled string
+	}
+	overrides := make(map[string]*OverrideInfo)
+	var overrideOrder []string
+
+	for _, item := range overridesData {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		uuid, _ := m["uuid"].(string)
+		host, _ := m["hostname"].(string)
+		domain, _ := m["domain"].(string)
+		ip, _ := m["server"].(string)
+		enabled, _ := m["enabled"].(string)
+		if uuid == "" {
+			continue
+		}
+		overrides[uuid] = &OverrideInfo{UUID: uuid, Host: host, Domain: domain, IP: ip, Enabled: enabled}
+		overrideOrder = append(overrideOrder, uuid)
+	}
+
+	// Build a map of override UUID -> list of aliases
+	type AliasInfo struct {
+		FQDN string
+		UUID string
+		Desc string
+	}
+	aliasMap := make(map[string][]*AliasInfo)
+
+	for _, item := range aliasesData {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hostOverrideUUID, _ := m["host"].(string)
+		hostname, _ := m["hostname"].(string)
+		domain, _ := m["domain"].(string)
+		uuid, _ := m["uuid"].(string)
+		desc, _ := m["description"].(string)
+		if hostname == "" || domain == "" {
+			continue
+		}
+		fqdn := hostname + "." + domain
+		aliasMap[hostOverrideUUID] = append(aliasMap[hostOverrideUUID], &AliasInfo{
+			FQDN: fqdn, UUID: uuid, Desc: desc,
+		})
+	}
+
+	// Collect orphans (aliases not linked to any known override)
+	var orphans []*AliasInfo
+	for hoUUID, aliases := range aliasMap {
+		if _, exists := overrides[hoUUID]; !exists {
+			orphans = append(orphans, aliases...)
+		}
+	}
+
+	// Print
+	fmt.Println("\n--- OPNsense Unbound DNS ---")
+	totalAliases := 0
+
+	for _, uuid := range overrideOrder {
+		info := overrides[uuid]
+		status := "[on]"
+		if info.Enabled != "1" {
+			status = "[off]"
+		}
+		aliases := aliasMap[uuid]
+		totalAliases += len(aliases)
+
+		fmt.Printf("\n  %s %s.%s -> %s  %s\n", status, info.Host, info.Domain, info.IP, info.UUID)
+
+		if len(aliases) > 0 {
+			// Sort aliases by FQDN for deterministic output
+			sort.Slice(aliases, func(i, j int) bool {
+				return aliases[i].FQDN < aliases[j].FQDN
+			})
+			for _, a := range aliases {
+				fmt.Printf("    + %s\n", a.FQDN)
+			}
+		} else {
+			fmt.Printf("    (no aliases)\n")
+		}
+	}
+
+	// Print orphans
+	if len(orphans) > 0 {
+		fmt.Printf("\n  [orphaned aliases - no matching host override]\n")
+		sort.Slice(orphans, func(i, j int) bool {
+			return orphans[i].FQDN < orphans[j].FQDN
+		})
+		for _, a := range orphans {
+			fmt.Printf("    + %s\n", a.FQDN)
+		}
+	}
+
+	fmt.Printf("\n  Total: %d host overrides, %d aliases\n", len(overrides), totalAliases)
+	return nil
+}
+
+// ClearManagedAliases deletes only the Unbound aliases linked to the given Host
+// Override UUID -- the "anchor" entry tuda-sync manages. Aliases attached to any
+// other host override, including manually created ones, are left untouched.
+func (o *OpnsenseClient) ClearManagedAliases(proxyHostUUID string) error {
+	if proxyHostUUID == "" {
+		return fmt.Errorf("refusing to clear aliases: no host override UUID configured (set DEFAULT_PROXY_HOST_UUID or --proxy-uuid)")
+	}
+
+	logger.Info().Str("proxyUUID", proxyHostUUID).Msg("Clearing Unbound aliases managed by tuda-sync...")
 
 	// 1. Get the list of all aliases
 	payload := map[string]interface{}{
-		"current": 1,
+		"current":  1,
 		"rowCount": 500,
-		"sort": map[string]interface{}{},
+		"sort":     map[string]interface{}{},
 	}
-	
+
 	result, err := o.makeRequest(http.MethodPost, "search_host_alias", payload)
 	if err != nil {
 		return fmt.Errorf("failed to fetch aliases for clearing: %w", err)
 	}
-	
-	// 2. Extract UUIDs from the aliases list
+
+	// 2. Extract the aliases list
 	aliases, ok := result["rows"].([]interface{})
 	if !ok || len(aliases) == 0 {
 		logger.Debug().Msg("No aliases found to clear")
 		return nil
 	}
-	
-	logger.Debug().Int("count", len(aliases)).Msg("Found existing aliases. Deleting...")
 
-	// 3. Iterate and delete each alias by UUID
+	logger.Debug().Int("count", len(aliases)).Msg("Found existing aliases. Selecting managed ones...")
+
+	// 3. Iterate and delete only the aliases linked to our host override
+	var deleted, preserved int
 	for _, item := range aliases {
 		aliasMap, ok := item.(map[string]interface{})
 		if !ok { continue }
-		
+
 		uuid, ok := aliasMap["uuid"].(string)
 		if !ok { continue }
-		
+
+		// Leave anything not linked to our anchor override alone.
+		if linkedHost, _ := aliasMap["host"].(string); linkedHost != proxyHostUUID {
+			preserved++
+			continue
+		}
+
 		// Attempt to delete - append UUID to the endpoint path
 		// OPNsense expects the UUID in the URL path, not the request body
-		_, err := o.makeRequest(http.MethodPost, "del_host_alias/"+uuid, map[string]interface{}{})
-		if err != nil {
+		if _, err := o.makeRequest(http.MethodPost, "del_host_alias/"+uuid, map[string]interface{}{}); err != nil {
 			logger.Warn().Str("uuid", uuid).Err(err).Msg("Failed to delete alias")
-		} else {
-			hostname, _ := aliasMap["hostname"].(string)
-			domain, _ := aliasMap["domain"].(string)
-			logger.Debug().Str("hostname", hostname).Str("domain", domain).Str("uuid", uuid).Msg("Deleted alias")
-			
-			// Remove from cache if present
-			fqdn := hostname + "." + domain
-			o.removeCachedAlias(fqdn)
+			continue
 		}
-	}
-    
-    // 4. Trigger Unbound reconfiguration once all deletions are complete
-    if err := o.Reconfigure(); err != nil {
-        return fmt.Errorf("failed to reconfigure Unbound after clearing aliases: %w", err)
-    }
 
-	logger.Debug().Msg("Alias clearing complete")
+		hostname, _ := aliasMap["hostname"].(string)
+		domain, _ := aliasMap["domain"].(string)
+		logger.Debug().Str("hostname", hostname).Str("domain", domain).Str("uuid", uuid).Msg("Deleted alias")
+
+		// Remove from cache if present
+		o.removeCachedAlias(hostname + "." + domain)
+		deleted++
+	}
+
+	logger.Info().Int("deleted", deleted).Int("preserved", preserved).Msg("Alias clearing complete")
+
+	// A configured UUID that matches nothing usually means DEFAULT_PROXY_HOST_UUID
+	// points at the wrong host override. Say so loudly rather than silently no-op.
+	if deleted == 0 && preserved > 0 {
+		logger.Warn().Str("proxyUUID", proxyHostUUID).Int("preserved", preserved).
+			Msg("No aliases were linked to the configured host override. Verify DEFAULT_PROXY_HOST_UUID against 'tuda-sync list'")
+	}
+
+	// 4. Nothing was removed, so Unbound does not need to be reloaded
+	if deleted == 0 {
+		return nil
+	}
+
+	// 5. Trigger Unbound reconfiguration once all deletions are complete
+	if err := o.Reconfigure(); err != nil {
+		return fmt.Errorf("failed to reconfigure Unbound after clearing aliases: %w", err)
+	}
+
 	return nil
 }
-
 
 // CreateAlias adds a new alias, linked to the specified Host Override UUID
 func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider string, service string) error {
@@ -595,6 +760,87 @@ func (o *OpnsenseClient) removeCachedAlias(fqdn string) {
 	o.cacheMutex.Lock()
 	defer o.cacheMutex.Unlock()
 	delete(o.aliasCache, fqdn)
+}
+
+// ListAliases fetches and prints all configured Host Aliases (FQDN, description, UUID).
+func (o *OpnsenseClient) ListAliases() error {
+	logger.Info().Msg("Fetching Unbound Host Aliases from OPNsense...")
+
+	payload := map[string]interface{}{
+		"current":  1,
+		"rowCount": 500,
+		"sort":     map[string]interface{}{},
+	}
+
+	result, err := o.makeRequest(http.MethodPost, "search_host_alias", payload)
+	if err != nil {
+		return err
+	}
+
+	aliases, ok := result["rows"].([]interface{})
+	if !ok {
+		return fmt.Errorf("failed to parse host aliases list: expected 'rows' key")
+	}
+
+	logger.Info().Msg("\n--- OPNsense Unbound Host Aliases ---")
+	fmt.Printf("%-40s | %-35s | %s\n", "FQDN", "DESCRIPTION", "UUID")
+	fmt.Println(strings.Repeat("-", 101))
+
+	for _, item := range aliases {
+		aliasMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		hostname, _ := aliasMap["hostname"].(string)
+		domain, _ := aliasMap["domain"].(string)
+		uuid, _ := aliasMap["uuid"].(string)
+		description, _ := aliasMap["description"].(string)
+
+		fqdn := hostname + "." + domain
+		if description == "" {
+			description = "-"
+		}
+
+		fmt.Printf("%-40s | %-35s | %s\n", fqdn, description, uuid)
+	}
+
+	fmt.Println(strings.Repeat("-", 101))
+	return nil
+}
+
+// GetAliasesForDiff returns a set of FQDNs currently on OPNsense (for diff comparison)
+func (o *OpnsenseClient) GetAliasesForDiff() (map[string]struct{}, error) {
+	payload := map[string]interface{}{
+		"current":  1,
+		"rowCount": 500,
+		"sort":     map[string]interface{}{},
+	}
+
+	result, err := o.makeRequest(http.MethodPost, "search_host_alias", payload)
+	if err != nil {
+		return nil, err
+	}
+
+	aliases, ok := result["rows"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("failed to parse host aliases list")
+	}
+
+	fqdnSet := make(map[string]struct{})
+	for _, item := range aliases {
+		aliasMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		hostname, _ := aliasMap["hostname"].(string)
+		domain, _ := aliasMap["domain"].(string)
+		if hostname != "" && domain != "" {
+			fqdnSet[hostname+"."+domain] = struct{}{}
+		}
+	}
+
+	return fqdnSet, nil
 }
 
 // checkHostOverrideExists verifies that a host override UUID exists in OPNsense

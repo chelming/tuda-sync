@@ -198,9 +198,77 @@ docker run -d \
 
 ***
 
+## 🛠️ CLI Commands
+
+tuda-sync supports several one-shot commands via `docker exec` for debugging and manual sync operations. All commands require the same environment variables as the main process.
+
+### Available Commands
+
+| Command | Description |
+| :--- | :--- |
+| `help` | Show available commands |
+| `list` | Show host overrides with their child aliases (tree view) |
+| `aliases` | List all DNS aliases on OPNsense (flat list) |
+| `scan` | Scan Traefik routes and create missing DNS aliases (non-destructive) |
+| `scan-routes` | Full scan of all Traefik routes, including cleanup of stale aliases |
+| `diff` | Compare Traefik routes vs OPNsense aliases — shows what's missing or stale |
+| `resync` | **Full re-sync**: clear the managed aliases, then rebuild them from Traefik |
+
+### Usage Examples
+
+```bash
+# Show available commands
+docker exec tuda-sync tuda-sync help
+
+# See what DNS aliases tuda-sync has created on OPNsense (tree view)
+docker exec tuda-sync tuda-sync list
+
+# Check if Traefik and OPNsense are in sync
+docker exec tuda-sync tuda-sync diff
+
+# Force a full re-sync (clears and rebuilds the aliases tuda-sync manages)
+docker exec tuda-sync tuda-sync resync
+
+# Just scan and create missing aliases (won't delete anything)
+docker exec tuda-sync tuda-sync scan
+```
+
+### `diff` Command Output
+
+The `diff` command shows a side-by-side comparison:
+
+```
+--- Diff: Traefik routes vs OPNsense aliases ---
+Traefik routes: 15 | OPNsense aliases: 14 | In both: 13
+
+Missing from OPNsense (should be created):
+  + newservice.hlm.ing
+  + another.hlm.ing
+
+Stale on OPNsense (no matching Traefik route):
+  - oldservice.hlm.ing
+
+Sync status: OUT OF SYNC
+```
+
+### `resync` Command
+
+The `resync` command performs a complete synchronization in 3 steps:
+1. **Clear** the Unbound aliases linked to `DEFAULT_PROXY_HOST_UUID`
+2. **Invalidate** the Traefik router cache
+3. **Rebuild** those aliases from current Traefik routes
+
+Only aliases attached to your anchor host override are removed — manually created
+aliases linked to any other host override are left untouched. `DEFAULT_PROXY_HOST_UUID`
+must be set, since it defines the scope of both the clear and the rebuild.
+
+Use this when things are significantly out of sync and you want a clean slate.
+
+***
+
 ## ⭐ Best Practice: Using `CLEAN_ON_START` Safely
 
-The `CLEAN_ON_START=true` environment variable is powerful but deletes **ALL** Unbound aliases. To prevent accidentally deleting manual DNS entries, we strongly recommend creating a dedicated "anchor" host override.
+The `CLEAN_ON_START=true` environment variable deletes every Unbound alias linked to `DEFAULT_PROXY_HOST_UUID`. To keep that blast radius away from your manual DNS entries, we strongly recommend pointing it at a dedicated "anchor" host override rather than at a host override you also manage by hand.
 
 ### Recommended Setup Steps:
 1. Create a Dedicated Alias Anchor ⚓
