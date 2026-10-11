@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/chelming/tuda-sync/actions/workflows/docker-build.yml/badge.svg)](https://github.com/chelming/tuda-sync/actions/workflows/docker-build.yml)
 [![Go Security](https://github.com/chelming/tuda-sync/actions/workflows/go-security.yml/badge.svg)](https://github.com/chelming/tuda-sync/actions/workflows/go-security.yml)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/chelming/tuda-sync)](https://github.com/chelming/tuda-sync/blob/main/go.mod)
-[![License](https://img.shields.io/badge/license-Non%20Commercial-blue)](https://github.com/chelming/tuda-sync/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](https://github.com/chelming/tuda-sync/blob/main/LICENSE)
 [![Container Size](https://img.shields.io/badge/container%20size-~12MB-brightgreen)](https://github.com/chelming/tuda-sync/pkgs/container/tuda-sync)
 
 > **tuda-sync**: **T**raefik **U**nbound **D**ocker **A**lias Synchronization
@@ -34,14 +34,11 @@ tuda-sync uses a streamlined API-first approach:
 Pre-built container images are available from GitHub Container Registry:
 
 ```bash
-# Latest stable release (recommended for production)
+# Newest build of main (rebuilt on every push to main)
 docker pull ghcr.io/chelming/tuda-sync:latest
 
-# Latest development build
-docker pull ghcr.io/chelming/tuda-sync:nightly
-
-# Specific date-based version
-docker pull ghcr.io/chelming/tuda-sync:2025.09.28
+# Pin to a specific build by commit SHA
+docker pull ghcr.io/chelming/tuda-sync:<full-commit-sha>
 ```
 
 ## 👩‍💻 Contributing
@@ -50,9 +47,7 @@ Interested in contributing to tuda-sync? Check out our [contribution guidelines]
 
 - Building from source
 - Development setup
-- Creating releases
 - Container build process
-- Versioning conventions
 
 ## 🔒 Security
 
@@ -83,15 +78,7 @@ For detailed information about security considerations and mitigations, see our 
 
 ## 📄 License
 
-tuda-sync is released under a custom **Non-Commercial License**. This means:
-
-- ✅ Free for personal use
-- ✅ Free for educational use
-- ✅ Free for non-profit use
-- ✅ Free for internal use in organizations
-- ❌ Not for commercial distribution or sale
-
-For commercial licensing inquiries, please contact the copyright holder. See the [LICENSE](LICENSE) file for details.
+tuda-sync is released under the [GNU AGPL v3](LICENSE). It is free to use, modify and share. If you distribute a modified version, or run one as a network service, you must make your source available under the same license.
 
 ***
 

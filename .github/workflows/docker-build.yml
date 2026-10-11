@@ -5,11 +5,11 @@ name: Build and Publish Docker Image
 # 2. Tags the image locally for Trivy scanning
 # 3. Only pushes multi-platform images after security scan passes
 # 4. Avoids SHA tag format issues with Trivy scanning
+# No release tags or version numbers: every push to main publishes :latest
 
 on:
   push:
     branches: [ "main", "master" ]
-    tags: [ 'v*.*.*' ]  # Matches both semantic and date-based versions like v2025.09.28
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch: # Allow manual triggering
@@ -42,19 +42,11 @@ jobs:
           images: |
             ghcr.io/${{ github.repository_owner }}/tuda-sync
           tags: |
-            # For date-based releases: v2025.09.28 -> 2025.09.28 tag
-            type=semver,pattern={{version}}
-            # For date-based releases: v2025.09.28 -> 2025.09 tag (works for both semantic and date-based)
-            type=semver,pattern={{major}}.{{minor}}
-            # For all releases: latest tag
-            type=ref,event=tag,pattern=v.*,prefix=,suffix=,value=latest
-            # For main branch: nightly tag instead of latest
-            type=raw,value=nightly,enable={{is_default_branch}}
-            # Always tag with branch name
-            type=ref,event=branch
+            # Every push to the default branch publishes a new latest
+            type=raw,value=latest,enable={{is_default_branch}}
             # Tag PRs with PR number
             type=ref,event=pr
-            # Always include git SHA
+            # Always include git SHA (pin to a specific build)
             type=sha,format=long
 
       - name: Log in to GitHub Container Registry
@@ -83,8 +75,8 @@ jobs:
           # Export directly to Docker daemon
           outputs: type=docker
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VERSION=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
             VCS_REF=${{ github.sha }}
 
       # Show Docker images for debugging
@@ -119,8 +111,8 @@ jobs:
           # Standard registry output format for multi-platform
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/tuda-sync
           build-args: |
-            VERSION=${{ steps.meta.outputs.version }}
-            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VERSION=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
             VCS_REF=${{ github.sha }}
 
       # Diagnostic step to verify image was pushed correctly (only for non-PR builds)

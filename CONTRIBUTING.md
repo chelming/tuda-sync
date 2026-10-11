@@ -77,9 +77,8 @@ The project uses GitHub Actions for continuous integration and delivery. The Doc
 
 #### Automatic Builds
 
-1. **Push to Main Branch**: Any push to the `main` or `master` branch triggers a build and publishes a `nightly` tag
-2. **Release Tags**: Creating a release or tag (e.g., `v2025.09.28`) builds and publishes versioned images
-3. **Pull Requests**: PRs against the main branch are built but not published (for testing)
+1. **Push to Main Branch**: Any push to the `main` or `master` branch triggers a build and publishes `latest`
+2. **Pull Requests**: PRs against the main branch are built but not published (for testing)
 
 #### Manual Builds
 
@@ -93,56 +92,15 @@ You can trigger a build manually from the GitHub Actions tab:
 
 ### Image Tagging
 
-The CI process automatically creates several tags:
+The CI process creates these tags:
 
-- **Latest**: Points to the most recent stable release (`latest`)
-- **Nightly**: The most recent build from the main branch (`nightly`)
-- **Version**: For release tags (e.g., `v2025.09.28` → `2025.09.28`, `v2025.09` → `2025.09`, etc.)
-- **Commit SHA**: Every build includes a tag with the full Git commit SHA
-- **Branch**: Builds from branches get tagged with the branch name
+- **Latest**: The most recent build of the main branch (`latest`)
+- **Commit SHA**: Every build includes a tag with the full Git commit SHA, for pinning to a specific build
+- **Pull request**: PR builds are tagged with the PR number (built, not pushed)
+
+There are no release tags or version numbers.
 
 Images are published to: `ghcr.io/chelming/tuda-sync`
-
-## Creating Releases and Tags
-
-You can create releases and tags using either the GitHub web interface or the Git command line:
-
-### Using GitHub Web Interface (Recommended)
-
-1. Navigate to your repository on GitHub
-2. Click on "Releases" in the right sidebar
-3. Click "Create a new release"
-4. Enter a tag version (e.g., `v2025.09.28`)
-5. Write a title and description for your release
-6. Click "Publish release"
-
-This will automatically trigger the workflow to build and publish a tagged image.
-
-### Using Git Command Line
-
-```bash
-# Create a tag locally with today's date
-git tag v$(date +%Y.%m.%d)
-
-# Push the tag to GitHub 
-git push origin v$(date +%Y.%m.%d)
-
-# Example (specific date):
-# git tag v2025.09.28
-# git push origin v2025.09.28
-```
-
-### Versioning Conventions
-
-This project uses date-based versioning:
-
-**Date-based versioning** (e.g., `v2025.09.28`):
-- Good for projects with frequent updates
-- Clearly communicates when a release was made
-- Works well with the Docker tagging system
-- Example format: `v[YEAR].[MONTH].[DAY]`
-
-The workflow will automatically create appropriate Docker tags from this format. Just make sure to prefix your version with `v` (e.g., `v2025.09.28`).
 
 ## Code Style and Guidelines
 
