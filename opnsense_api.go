@@ -505,15 +505,17 @@ func (o *OpnsenseClient) ClearManagedAliases(proxyHostUUID string) error {
 	return nil
 }
 
-// CreateAlias adds a new alias, linked to the specified Host Override UUID
-func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider string, service string) error {
+// CreateAlias adds a new alias, linked to the specified Host Override UUID.
+// It reports whether it created one: false (with a nil error) means the alias
+// already existed, which is not a change.
+func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider string, service string) (bool, error) {
 	host, domain := splitFQDN(fqdn)
 	
 	// Check if this alias already exists (to avoid duplicates)
 	existingUUID, exists := o.getCachedAlias(fqdn)
 	if exists {
 		logger.Debug().Str("fqdn", fqdn).Str("uuid", existingUUID).Msg("Alias already exists, skipping creation")
-		return nil
+		return false, nil
 	}
 	
 	// Generate a descriptive comment with provider and service info if available
@@ -543,12 +545,12 @@ func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider
 	response, err := o.makeRequest(http.MethodPost, "add_host_alias", payload)
 	if err != nil {
 		if strings.Contains(err.Error(), "403 Forbidden") {
-			return fmt.Errorf("permission denied (403 Forbidden): the API key/secret may not have sufficient privileges to create aliases or access unbound settings. Check your OPNsense user permissions")
+			return false, fmt.Errorf("permission denied (403 Forbidden): the API key/secret may not have sufficient privileges to create aliases or access unbound settings. Check your OPNsense user permissions")
 		}
 		if strings.Contains(err.Error(), "400 Bad Request") {
-			return fmt.Errorf("bad request (400): the OPNsense API rejected the request format. Payload: %v", payload)
+			return false, fmt.Errorf("bad request (400): the OPNsense API rejected the request format. Payload: %v", payload)
 		}
-		return err
+		return false, err
 	}
 	
 	// Extract UUID from the response
@@ -563,7 +565,7 @@ func (o *OpnsenseClient) CreateAlias(fqdn string, proxyHostUUID string, provider
 		logger.Warn().Str("fqdn", fqdn).Interface("response", response).Msg("Created alias but could not extract UUID from response")
 	}
 	
-	return nil
+	return true, nil
 }
 
 // GetAllAliases returns a map of all existing aliases (FQDN -> UUID)
@@ -602,12 +604,20 @@ func (o *OpnsenseClient) GetAllAliases() (map[string]string, error) {
 		if hostOk && domainOk && uuidOk {
 			fqdn := hostname + "." + domain
 			aliasMap[fqdn] = uuid
-			
-			// Update our cache
-			o.setCachedAlias(fqdn, uuid)
 		}
 	}
 	
+	// Replace the cache with what OPNsense really holds. Only adding to it left
+	// stale entries behind: an alias deleted out of band stayed "cached", so
+	// CreateAlias skipped it and the name never came back until a restart.
+	cache := make(map[string]string, len(aliasMap))
+	for fqdn, uuid := range aliasMap {
+		cache[fqdn] = uuid
+	}
+	o.cacheMutex.Lock()
+	o.aliasCache = cache
+	o.cacheMutex.Unlock()
+
 	logger.Debug().Int("count", len(aliasMap)).Msg("Retrieved current aliases")
 	return aliasMap, nil
 }

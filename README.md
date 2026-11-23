@@ -120,8 +120,8 @@ The application is configured exclusively using **environment variables**, which
 | **`SCAN_ALL_ROUTES`** | **`false`** | **NEW:** Set to `true` to scan all Traefik routes (including file-based configs) periodically. |
 | **`ROUTE_SCAN_INTERVAL`** | **`5m`** | **NEW:** Interval for scanning all Traefik routes when SCAN_ALL_ROUTES is enabled. |
 | **`STARTUP_SCAN_DELAY`** | **`10s`** | **NEW:** Delay before initial Traefik scan on startup to allow Traefik to fully initialize. Increase if routes are missing on first scan. |
-| **`DELAYED_ROUTER_CHECKS`** | **`false`** | **NEW:** Set to `true` to enable delayed router checks after container start. |
-| **`DELAYED_CHECK_INITIAL_DELAY`** | **`5s`** | **NEW:** Initial delay before first check after container start. |
+| **`DELAYED_ROUTER_CHECKS`** | **`true`** | Follow-up scans after a container starts or stops, to catch routers that Traefik builds (or drops) a moment after the event. On by default; set to `false` to disable. |
+| **`DELAYED_CHECK_INITIAL_DELAY`** | **`5s`** | **NEW:** Delay before the first follow-up scan after a container start/stop event. |
 | **`DELAYED_CHECK_MAX_DELAY`** | **`60s`** | **NEW:** Maximum delay between checks. |
 | **`DELAYED_CHECK_MAX_DURATION`** | **`5m`** | **NEW:** Maximum total duration for delayed checks. |
 | **`DELAYED_CHECK_COUNT`** | **`5`** | **NEW:** Number of delayed checks to perform. |
@@ -360,19 +360,20 @@ environment:
 
 This approach ensures DNS aliases are created for all **enabled** routes, regardless of source.
 
-### 🕒 Delayed Router Checks
+### 🕒 Follow-up Scans (Delayed Router Checks)
 
-Some containers need time to initialize before registering their routes with Traefik. You can enable delayed router checks to catch routes that appear after a container starts:
+Traefik learns about a new (or stopped) container from the same Docker event tuda-sync does, and takes a moment to build (or drop) its router. The scan tuda-sync runs inside the event handler therefore usually still sees the old router set: a new container would wait for the next periodic scan (up to `ROUTE_SCAN_INTERVAL`, 5 minutes) to get its DNS alias, and a stopped one would keep its alias that long.
+
+To close that gap, tuda-sync re-scans a few times after every container start/stop event (about 5, 10, 20, 40 and 60 seconds later). The follow-up scans bypass the router cache and create aliases for new routers *and* delete aliases whose routers are gone. They are **on by default**; tune or disable them with:
 
 ```yaml
 environment:
-  # Enable delayed router checking
-  - DELAYED_ROUTER_CHECKS=true      # Enable delayed router checks
-  - DELAYED_CHECK_COUNT=5           # Number of checks to perform
-  - DELAYED_CHECK_MAX_DURATION=5m   # Maximum total check duration
+  - DELAYED_ROUTER_CHECKS=false     # disable the follow-up scans (default: true)
+  - DELAYED_CHECK_COUNT=5           # Number of follow-up scans
+  - DELAYED_CHECK_MAX_DURATION=5m   # Maximum total duration of one series
 ```
 
-This will perform multiple checks after a container starts to catch any routes that appear during initialization. See [Delayed Router Checks](docs/DELAYED_CHECKS.md) for more details and advanced configuration options.
+See [Follow-up Scans](docs/DELAYED_CHECKS.md) for details and advanced configuration options.
 
 - Docker container labels
 - Static configurations in Traefik's file provider

@@ -96,6 +96,18 @@ func getEnvBool(key string) bool {
 	return strings.ToLower(os.Getenv(key)) == "true"
 }
 
+// Helper function to check an environment variable that defaults to a value: unset
+// keeps the default, "true"/"false" (any case) overrides it
+func getEnvBoolDefault(key string, def bool) bool {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return def
+}
+
 // Helper function to get a duration from an environment variable with a default
 func getEnvDuration(key string, defaultDuration time.Duration) time.Duration {
 	if envValue := os.Getenv(key); envValue != "" {
@@ -194,7 +206,7 @@ func init() {
 	flag.DurationVar(&startupScanDelay, "startup-scan-delay", getEnvDuration("STARTUP_SCAN_DELAY", 10*time.Second), "Delay before initial Traefik scan on startup to allow Traefik to initialize. (Env: STARTUP_SCAN_DELAY, default: 10s)")
 	
 	// 5. Delayed router check configuration
-	flag.BoolVar(&enableDelayedChecks, "delayed-checks", getEnvBool("DELAYED_ROUTER_CHECKS"), "Whether to perform delayed checks for new routers after container start. (Env: DELAYED_ROUTER_CHECKS=true)")
+	flag.BoolVar(&enableDelayedChecks, "delayed-checks", getEnvBoolDefault("DELAYED_ROUTER_CHECKS", true), "Whether to run follow-up scans after a container starts or stops, to catch routers that appear (or vanish) a moment later. (Env: DELAYED_ROUTER_CHECKS, default: true)")
 	
 	// Initialize delayed check options with defaults
 	delayedRouterChecks = DefaultDelayedCheckOptions()
@@ -602,16 +614,11 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 	containerName := strings.TrimPrefix(msg.Actor.Attributes["name"], "/")
 	logger.Debug().Str("action", actionStr).Str("container", containerName).Msg("Received Docker event")
 	
-	// If this is a 'die' event, invalidate the router cache
-	if actionStr == "die" {
-		// Clear the router cache to force a fresh fetch
-		traefikRouterCache.mutex.Lock()
-		traefikRouterCache.routers = nil
-		traefikRouterCache.lastFetched = time.Time{}
-		traefikRouterCache.mutex.Unlock()
-		
-		logger.Debug().Msg("Container stop event detected, cleared Traefik router cache")
-	}
+	// A start adds routers and a die removes them, so the cached router list is
+	// stale either way: drop it so the scan below reads the current set. (Only die
+	// used to do this, which left a brand-new container out of the next scans.)
+	invalidateRouterCache()
+	logger.Debug().Str("action", actionStr).Msg("Cleared Traefik router cache")
 
 	// For any container event, scan all Traefik routes immediately
 	// We don't need to check if the container is Traefik-enabled
@@ -628,12 +635,12 @@ func handleDockerEvent(opnsenseClient *OpnsenseClient, msg events.Message) {
 			logger.Debug().Msg("Successfully updated DNS aliases based on Traefik routes")
 		}
 		
-		// For container start events, set up delayed monitoring to catch routers
-		// that appear after container initialization
-		if actionStr == "start" {
-			logger.Debug().Str("container", containerName).Msg("Setting up delayed router checks for started container")
-			monitorContainerStartRouters(containerName, opnsenseClient)
-		}
+		// Traefik builds its routers a moment after the event this scan was
+		// triggered by, so the scan above usually misses them (or still sees the
+		// routers of a container that just died). Scan again shortly after, so a
+		// started container gets its alias and a stopped one loses it without
+		// waiting for the periodic scan.
+		scheduleFollowUpScans(containerName, actionStr, opnsenseClient)
 	} else {
 		logger.Warn().Msg("Traefik API not enabled or configured. Set TRAEFIK_USE_API=true and TRAEFIK_API_URL to enable scanning")
 	}
@@ -688,6 +695,15 @@ type TraefikRouter struct {
 	Using    []string          `json:"using"`
 	Name     string            `json:"name"`
 	Provider string            `json:"provider"`
+}
+
+// invalidateRouterCache drops the cached Traefik router list, so that the next
+// fetch goes to the API
+func invalidateRouterCache() {
+	traefikRouterCache.mutex.Lock()
+	traefikRouterCache.routers = nil
+	traefikRouterCache.lastFetched = time.Time{}
+	traefikRouterCache.mutex.Unlock()
 }
 
 // fetchTraefikRouters fetches all routers from Traefik API or returns cached results if available

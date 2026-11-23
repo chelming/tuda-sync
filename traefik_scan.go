@@ -4,9 +4,22 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-	
+
 	// We use the logger declared in main.go
+)
+
+var (
+	// scanMu serialises scans: the periodic scanner, the event handler and the
+	// follow-up scans would otherwise race to create the same alias twice
+	scanMu sync.Mutex
+
+	// unboundDirty is set when aliases changed and cleared only once Unbound has
+	// been reconfigured, so a failed reconfigure is retried by the next scan
+	// instead of leaving the changes unapplied
+	unboundDirty atomic.Bool
 )
 
 // Function to scan all Traefik routers and create DNS aliases for them
@@ -15,6 +28,9 @@ import (
 // - File-based configurations
 // - Other providers (e.g., Kubernetes CRDs if Traefik is running in a Kubernetes cluster)
 func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) error {
+	scanMu.Lock()
+	defer scanMu.Unlock()
+
 	// Log what we're doing
 	logger.Debug().Msg("Scanning all Traefik routes for Host rules...")
 
@@ -86,12 +102,16 @@ func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) e
 
 		// Queue the alias creation (without reconfiguring each time)
 		logger.Debug().Str("fqdn", fqdn).Str("router", router.Name).Str("provider", router.Provider).Str("service", router.Service).Msg("Queueing alias for Traefik route")
-		if err := opnsenseClient.CreateAlias(fqdn, defaultProxyHostUUID, router.Provider, router.Service); err != nil {
+		created, err := opnsenseClient.CreateAlias(fqdn, defaultProxyHostUUID, router.Provider, router.Service)
+		if err != nil {
 			logger.Warn().Err(err).Str("fqdn", fqdn).Msg("Failed to create alias")
 			continue
 		}
 
-		aliasCount++
+		// Only a new alias is a change: an existing one is skipped by CreateAlias
+		if created {
+			aliasCount++
+		}
 	}
 
 	// Clean up stale aliases (those that no longer have a corresponding router)
@@ -113,18 +133,26 @@ func scanAllTraefikRoutes(ctx context.Context, opnsenseClient *OpnsenseClient) e
 		}
 	}
 	
-	// Only reconfigure once after all aliases have been processed (created and deleted)
-	needsReconfigure := aliasCount > 0 || deletedCount > 0
-	
-	if needsReconfigure {
+	aliasCreations.Add(float64(aliasCount))
+	aliasDeletions.Add(float64(deletedCount))
+
+	if aliasCount > 0 || deletedCount > 0 {
 		logger.Info().Int("created", aliasCount).Int("deleted", deletedCount).Int("skipped", skipCount).Msg("Processed Traefik router aliases")
+		unboundDirty.Store(true)
+	}
+
+	// Only reconfigure once after all aliases have been processed (created and
+	// deleted), and only if there is something Unbound has not applied yet
+	if unboundDirty.Load() {
 		logger.Debug().Msg("Reconfiguring Unbound with all alias changes...")
 		if err := opnsenseClient.Reconfigure(); err != nil {
+			reconfigureFailures.Inc()
 			return fmt.Errorf("failed to reconfigure Unbound after processing aliases: %w", err)
 		}
+		unboundDirty.Store(false)
 		logger.Debug().Msg("Unbound reconfiguration complete")
 	} else {
-		logger.Info().Int("skipped", skipCount).Msg("No alias changes needed")
+		logger.Debug().Int("skipped", skipCount).Msg("No alias changes needed")
 	}
 
 	return nil
